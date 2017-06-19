@@ -53,9 +53,6 @@ func errResp(code errCode, format string, v ...interface{}) error {
 	return fmt.Errorf("%v - %v", code, fmt.Sprintf(format, v...))
 }
 
-type hashFetcherFn func(common.Hash) error
-type blockFetcherFn func([]common.Hash) error
-
 type ProtocolManager struct {
 	networkId int
 
@@ -65,7 +62,7 @@ type ProtocolManager struct {
 	txpool      txPool
 	blockchain  *core.BlockChain
 	chaindb     ethdb.Database
-	chainconfig *core.ChainConfig
+	chainConfig *core.ChainConfig
 
 	downloader *downloader.Downloader
 	fetcher    *fetcher.Fetcher
@@ -100,7 +97,7 @@ func NewProtocolManager(config *core.ChainConfig, fastSync bool, networkId int, 
 		txpool:      txpool,
 		blockchain:  blockchain,
 		chaindb:     chaindb,
-		chainconfig: config,
+		chainConfig: config,
 		peers:       newPeerSet(),
 		newPeerCh:   make(chan *peer),
 		noMorePeers: make(chan struct{}),
@@ -172,8 +169,7 @@ func NewProtocolManager(config *core.ChainConfig, fastSync bool, networkId int, 
 	manager.fetcher = fetcher.New(blockchain.GetBlock, validator, manager.BroadcastBlock, heighter, inserter, manager.removePeer)
 
 	if blockchain.Genesis().Hash().Hex() == defaultGenesisHash && networkId == 1 {
-		glog.V(logger.Debug).Infoln("Bad Block Reporting is enabled")
-		manager.badBlockReportingEnabled = true
+		manager.badBlockReportingEnabled = false
 	}
 
 	return manager, nil
@@ -181,7 +177,7 @@ func NewProtocolManager(config *core.ChainConfig, fastSync bool, networkId int, 
 
 func (pm *ProtocolManager) insertChain(blocks types.Blocks) (i int, err error) {
 	i, err = pm.blockchain.InsertChain(blocks)
-	if pm.badBlockReportingEnabled && core.IsValidationErr(err) && i < len(blocks) {
+	if err != nil && pm.badBlockReportingEnabled && core.IsValidateError(err) {
 		go sendBadBlockReport(blocks[i], err)
 	}
 	return i, err
@@ -271,15 +267,43 @@ func (pm *ProtocolManager) handle(p *peer) error {
 	defer pm.removePeer(p.id)
 
 	// Register the peer in the downloader. If the downloader considers it banned, we disconnect
-	if err := pm.downloader.RegisterPeer(p.id, p.version, p.Head(),
-		p.RequestHashes, p.RequestHashesFromNumber, p.RequestBlocks, p.RequestHeadersByHash,
-		p.RequestHeadersByNumber, p.RequestBodies, p.RequestReceipts, p.RequestNodeData); err != nil {
+	// TODO Causing error in tests
+	if err := pm.downloader.RegisterPeer(p.id, p.version, p.Head,
+		p.RequestHeadersByHash, p.RequestHeadersByNumber, p.RequestBodies,
+		p.RequestReceipts, p.RequestNodeData); err != nil {
 		return err
 	}
 	// Propagate existing transactions. new transactions appearing
 	// after this will be sent via broadcasts.
 	pm.syncTransactions(p)
 
+	// Drop connections on opposite side of network split
+	var fork *core.Fork
+	for i := range pm.chainConfig.Forks {
+		fork = pm.chainConfig.Forks[i]
+		if _, height := p.Head(); height.Cmp(fork.Block) < 0 {
+			break
+		}
+		if !fork.RequiredHash.IsEmpty() {
+			// Request the peer's fork block header for extra-dat
+			if err := p.RequestHeadersByNumber(fork.Block.Uint64(), 1, 0, false); err != nil {
+				glog.V(logger.Warn).Infof("%v: error requesting headers by number ", p)
+				return err
+			}
+			// Start a timer to disconnect if the peer doesn't reply in time
+			p.timeout = time.AfterFunc((5 * time.Second), func() {
+				glog.V(logger.Debug).Infof("%v: timed out fork-check, dropping", p)
+				pm.removePeer(p.id)
+			})
+			// Make sure it's cleaned up if the peer dies off
+			defer func() {
+				if p.timeout != nil {
+					p.timeout.Stop()
+					p.timeout = nil
+				}
+			}()
+		}
+	}
 	// main loop. handle incoming messages.
 	for {
 		if err := pm.handleMsg(p); err != nil {
@@ -307,107 +331,6 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 	case msg.Code == StatusMsg:
 		// Status messages should never arrive after the handshake
 		return errResp(ErrExtraStatusMsg, "uncontrolled status message")
-
-	case p.version < eth62 && msg.Code == GetBlockHashesMsg:
-		// Retrieve the number of hashes to return and from which origin hash
-		var request getBlockHashesData
-		if err := msg.Decode(&request); err != nil {
-			return errResp(ErrDecode, "%v: %v", msg, err)
-		}
-		if request.Amount > uint64(downloader.MaxHashFetch) {
-			request.Amount = uint64(downloader.MaxHashFetch)
-		}
-		// Retrieve the hashes from the block chain and return them
-		hashes := pm.blockchain.GetBlockHashesFromHash(request.Hash, request.Amount)
-		if len(hashes) == 0 {
-			glog.V(logger.Debug).Infof("invalid block hash %x", request.Hash.Bytes()[:4])
-		}
-		return p.SendBlockHashes(hashes)
-
-	case p.version < eth62 && msg.Code == GetBlockHashesFromNumberMsg:
-		// Retrieve and decode the number of hashes to return and from which origin number
-		var request getBlockHashesFromNumberData
-		if err := msg.Decode(&request); err != nil {
-			return errResp(ErrDecode, "%v: %v", msg, err)
-		}
-		if request.Amount > uint64(downloader.MaxHashFetch) {
-			request.Amount = uint64(downloader.MaxHashFetch)
-		}
-		// Calculate the last block that should be retrieved, and short circuit if unavailable
-		last := pm.blockchain.GetBlockByNumber(request.Number + request.Amount - 1)
-		if last == nil {
-			last = pm.blockchain.CurrentBlock()
-			request.Amount = last.NumberU64() - request.Number + 1
-		}
-		if last.NumberU64() < request.Number {
-			return p.SendBlockHashes(nil)
-		}
-		// Retrieve the hashes from the last block backwards, reverse and return
-		hashes := []common.Hash{last.Hash()}
-		hashes = append(hashes, pm.blockchain.GetBlockHashesFromHash(last.Hash(), request.Amount-1)...)
-
-		for i := 0; i < len(hashes)/2; i++ {
-			hashes[i], hashes[len(hashes)-1-i] = hashes[len(hashes)-1-i], hashes[i]
-		}
-		return p.SendBlockHashes(hashes)
-
-	case p.version < eth62 && msg.Code == BlockHashesMsg:
-		// A batch of hashes arrived to one of our previous requests
-		var hashes []common.Hash
-		if err := msg.Decode(&hashes); err != nil {
-			break
-		}
-		// Deliver them all to the downloader for queuing
-		err := pm.downloader.DeliverHashes(p.id, hashes)
-		if err != nil {
-			glog.V(logger.Debug).Infoln(err)
-		}
-
-	case p.version < eth62 && msg.Code == GetBlocksMsg:
-		// Decode the retrieval message
-		msgStream := rlp.NewStream(msg.Payload, uint64(msg.Size))
-		if _, err := msgStream.List(); err != nil {
-			return err
-		}
-		// Gather blocks until the fetch or network limits is reached
-		var (
-			hash   common.Hash
-			bytes  common.StorageSize
-			blocks []*types.Block
-		)
-		for len(blocks) < downloader.MaxBlockFetch && bytes < softResponseLimit {
-			//Retrieve the hash of the next block
-			err := msgStream.Decode(&hash)
-			if err == rlp.EOL {
-				break
-			} else if err != nil {
-				return errResp(ErrDecode, "msg %v: %v", msg, err)
-			}
-			// Retrieve the requested block, stopping if enough was found
-			if block := pm.blockchain.GetBlock(hash); block != nil {
-				blocks = append(blocks, block)
-				bytes += block.Size()
-			}
-		}
-		return p.SendBlocks(blocks)
-
-	case p.version < eth62 && msg.Code == BlocksMsg:
-		// Decode the arrived block message
-		var blocks []*types.Block
-		if err := msg.Decode(&blocks); err != nil {
-			glog.V(logger.Detail).Infoln("Decode error", err)
-			blocks = nil
-		}
-		// Update the receive timestamp of each block
-		for _, block := range blocks {
-			block.ReceivedAt = msg.ReceivedAt
-			block.ReceivedFrom = p
-		}
-		// Filter out any explicitly requested blocks, deliver the rest to the downloader
-		if blocks := pm.fetcher.FilterBlocks(blocks); len(blocks) > 0 {
-			pm.downloader.DeliverBlocks(p.id, blocks)
-		}
-
 	// Block header query, collect the requested headers and reply
 	case p.version >= eth62 && msg.Code == GetBlockHeadersMsg:
 		// Decode the complex header query
@@ -482,11 +405,21 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 			return errResp(ErrDecode, "msg %v: %v", msg, err)
 		}
 		// Filter out any explicitly requested headers, deliver the rest to the downloader
-		filter := len(headers) == 1
-		if filter {
+		isForkCheck := len(headers) == 1
+		if isForkCheck {
+			if p.timeout != nil {
+				// Disable the fork drop timeout
+				p.timeout.Stop()
+				p.timeout = nil
+			}
+			if err := pm.chainConfig.HeaderCheck(headers[0]); err != nil {
+				pm.removePeer(p.id)
+				return err
+			}
+			// Irrelevant of the fork checks, send the header to the fetcher just in case
 			headers = pm.fetcher.FilterHeaders(headers, time.Now())
 		}
-		if len(headers) > 0 || !filter {
+		if len(headers) > 0 || !isForkCheck {
 			err := pm.downloader.DeliverHeaders(p.id, headers)
 			if err != nil {
 				glog.V(logger.Debug).Infoln(err)
@@ -661,7 +594,7 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		// Mark the hashes as present at the remote node
 		for _, block := range announces {
 			p.MarkBlock(block.Hash)
-			p.SetHead(block.Hash)
+			p.SetHead(block.Hash, p.td)
 		}
 		// Schedule all the unknown hashes for retrieval
 		unknown := make([]announce, 0, len(announces))
@@ -671,11 +604,8 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 			}
 		}
 		for _, block := range unknown {
-			if p.version < eth62 {
-				pm.fetcher.Notify(p.id, block.Hash, block.Number, time.Now(), p.RequestBlocks, nil, nil)
-			} else {
-				pm.fetcher.Notify(p.id, block.Hash, block.Number, time.Now(), nil, p.RequestOneHeader, p.RequestBodies)
-			}
+			// TODO Breaking /eth tests
+			pm.fetcher.Notify(p.id, block.Hash, block.Number, time.Now(), p.RequestOneHeader, p.RequestBodies)
 		}
 
 	case msg.Code == NewBlockMsg:
@@ -692,15 +622,24 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 
 		// Mark the peer as owning the block and schedule it for import
 		p.MarkBlock(request.Block.Hash())
-		p.SetHead(request.Block.Hash())
-
+		p.SetHead(request.Block.ParentHash(), request.TD)
 		pm.fetcher.Enqueue(p.id, request.Block)
 
-		// Update the peers total difficulty if needed, schedule a download if gapped
-		if request.TD.Cmp(p.Td()) > 0 {
-			p.SetTd(request.TD)
-			td := pm.blockchain.GetTd(pm.blockchain.CurrentBlock().Hash())
-			if request.TD.Cmp(new(big.Int).Add(td, request.Block.Difficulty())) > 0 {
+		// Assuming the block is importable by the peer, but possibly not yet done so,
+		// calculate the head hash and TD that the peer truly must have.
+		var (
+			trueHead = request.Block.ParentHash()
+			trueTD   = request.TD
+		)
+		// Update the peers total difficulty if better than the previous
+		if _, td := p.Head(); trueTD.Cmp(td) > 0 {
+			p.SetHead(trueHead, trueTD)
+
+			// Schedule a sync if above ours. Note, this will not fire a sync for a gap of
+			// a singe block (as the true TD is below the propagated block), however this
+			// scenario should easily be covered by the fetcher.
+			currentBlock := pm.blockchain.CurrentBlock()
+			if trueTD.Cmp(pm.blockchain.GetTd(currentBlock.Hash())) > 0 {
 				go pm.synchronise(p)
 			}
 		}
@@ -753,14 +692,10 @@ func (pm *ProtocolManager) BroadcastBlock(block *types.Block, propagate bool) {
 		}
 		glog.V(logger.Detail).Infof("propagated block %x to %d peers in %v", hash[:4], len(transfer), time.Since(block.ReceivedAt))
 	}
-	// Otherwise if the block is indeed in out own chain, announce it
+	// Otherwise if the block is indeed in our own chain, announce it
 	if pm.blockchain.HasBlock(hash) {
 		for _, peer := range peers {
-			if peer.version < eth62 {
-				peer.SendNewBlockHashes61([]common.Hash{hash})
-			} else {
-				peer.SendNewBlockHashes([]common.Hash{hash}, []uint64{block.NumberU64()})
-			}
+			peer.SendNewBlockHashes([]common.Hash{hash}, []uint64{block.NumberU64()})
 		}
 		glog.V(logger.Detail).Infof("announced block %x to %d peers in %v", hash[:4], len(peers), time.Since(block.ReceivedAt))
 	}
@@ -801,7 +736,7 @@ func (self *ProtocolManager) txBroadcastLoop() {
 // EthNodeInfo represents a short summary of the Ethereum sub-protocol metadata known
 // about the host peer.
 type EthNodeInfo struct {
-	Network    int         `json:"network"`    // Ethereum network ID (0=Olympic, 1=Frontier, 2=Morden)
+	Network    int         `json:"network"`    // Ethereum network ID (1=Mainnet, 2=Morden)
 	Difficulty *big.Int    `json:"difficulty"` // Total difficulty of the host's blockchain
 	Genesis    common.Hash `json:"genesis"`    // SHA3 hash of the host's genesis block
 	Head       common.Hash `json:"head"`       // SHA3 hash of the host's best owned block

@@ -19,6 +19,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
@@ -32,21 +33,31 @@ import (
 	"github.com/ethereumproject/go-ethereum/ethdb"
 	"github.com/ethereumproject/go-ethereum/logger/glog"
 	"github.com/ethereumproject/go-ethereum/node"
-	"github.com/ethereumproject/go-ethereum/params"
 	"github.com/ethereumproject/go-ethereum/tests"
 	"github.com/ethereumproject/go-ethereum/whisper"
+	"path/filepath"
+)
+
+// Version is the application revision identifier. It can be set with the linker
+// as in: go build -ldflags "-X main.Version="`git describe --tags`
+var Version = "unknown"
+
+var (
+	testFile    = flag.String("json", "", "Path to the .json test file to load")
+	testName    = flag.String("test", "", "Name of the test from the .json file to run")
+	testKey     = flag.String("key", defaultTestKey, "Private key of a test account to inject")
+	versionFlag = flag.Bool("version", false, "Prints the revision identifier and exit immediatily.")
 )
 
 const defaultTestKey = "b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291"
 
-var (
-	testFile = flag.String("json", "", "Path to the .json test file to load")
-	testName = flag.String("test", "", "Name of the test from the .json file to run")
-	testKey  = flag.String("key", defaultTestKey, "Private key of a test account to inject")
-)
-
 func main() {
 	flag.Parse()
+
+	if *versionFlag {
+		fmt.Println("gethrpctest version", Version)
+		os.Exit(0)
+	}
 
 	// Enable logging errors, we really do want to see those
 	glog.SetV(2)
@@ -95,7 +106,7 @@ func main() {
 func MakeSystemNode(keydir string, privkey string, test *tests.BlockTest) (*node.Node, error) {
 	// Create a networkless protocol stack
 	stack, err := node.New(&node.Config{
-		IPCPath:     node.DefaultIPCEndpoint(),
+		IPCPath:     node.DefaultIPCEndpoint(filepath.Join(common.DefaultDataDir(), "mainnet")),
 		HTTPHost:    common.DefaultHTTPHost,
 		HTTPPort:    common.DefaultHTTPPort,
 		HTTPModules: []string{"admin", "db", "eth", "debug", "miner", "net", "shh", "txpool", "personal", "web3"},
@@ -108,7 +119,11 @@ func MakeSystemNode(keydir string, privkey string, test *tests.BlockTest) (*node
 		return nil, err
 	}
 	// Create the keystore and inject an unlocked account if requested
-	accman := accounts.NewPlaintextManager(keydir)
+	accman, err := accounts.NewManager(keydir, accounts.LightScryptN, accounts.LightScryptP, false)
+	if err != nil {
+		return nil, err
+	}
+
 	if len(privkey) > 0 {
 		key, err := crypto.HexToECDSA(privkey)
 		if err != nil {
@@ -130,7 +145,7 @@ func MakeSystemNode(keydir string, privkey string, test *tests.BlockTest) (*node
 	ethConf := &eth.Config{
 		TestGenesisState: db,
 		TestGenesisBlock: test.Genesis,
-		ChainConfig:      &core.ChainConfig{HomesteadBlock: params.MainNetHomesteadBlock},
+		ChainConfig:      core.DefaultConfig,
 		AccountManager:   accman,
 	}
 	if err := stack.Register(func(ctx *node.ServiceContext) (node.Service, error) { return eth.New(ctx, ethConf) }); err != nil {

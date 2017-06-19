@@ -18,16 +18,15 @@ package eth
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/big"
 	"os"
 	"runtime"
-	"strings"
 	"sync"
 	"time"
 
@@ -48,8 +47,6 @@ import (
 	"github.com/ethereumproject/go-ethereum/p2p"
 	"github.com/ethereumproject/go-ethereum/rlp"
 	"github.com/ethereumproject/go-ethereum/rpc"
-	"github.com/syndtr/goleveldb/leveldb"
-	"golang.org/x/net/context"
 )
 
 const defaultGas = uint64(90000)
@@ -262,14 +259,6 @@ func (s *PrivateMinerAPI) Stop() bool {
 	return true
 }
 
-// SetExtra sets the extra data string that is included when this miner mines a block.
-func (s *PrivateMinerAPI) SetExtra(extra string) (bool, error) {
-	if err := s.e.Miner().SetExtra([]byte(extra)); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
 // SetGasPrice sets the minimum accepted gas price for the miner.
 func (s *PrivateMinerAPI) SetGasPrice(gasPrice rpc.HexNumber) bool {
 	s.e.Miner().SetGasPrice(gasPrice.BigInt())
@@ -416,6 +405,7 @@ func (s *PublicAccountAPI) Accounts() []accounts.Account {
 // It offers methods to create, (un)lock en list accounts. Some methods accept
 // passwords and are therefore considered private by default.
 type PrivateAccountAPI struct {
+	bc     *core.BlockChain
 	am     *accounts.Manager
 	txPool *core.TxPool
 	txMu   *sync.Mutex
@@ -425,6 +415,7 @@ type PrivateAccountAPI struct {
 // NewPrivateAccountAPI create a new PrivateAccountAPI.
 func NewPrivateAccountAPI(e *Ethereum) *PrivateAccountAPI {
 	return &PrivateAccountAPI{
+		bc:     e.blockchain,
 		am:     e.accountManager,
 		txPool: e.txPool,
 		txMu:   &e.txMu,
@@ -503,12 +494,14 @@ func (s *PrivateAccountAPI) SignAndSendTransaction(args SendTxArgs, passwd strin
 		tx = types.NewTransaction(args.Nonce.Uint64(), *args.To, args.Value.BigInt(), args.Gas.BigInt(), args.GasPrice.BigInt(), common.FromHex(args.Data))
 	}
 
+	tx.SetSigner(s.bc.Config().GetSigner(s.bc.CurrentBlock().Number()))
+
 	signature, err := s.am.SignWithPassphrase(args.From, passwd, tx.SigHash().Bytes())
 	if err != nil {
 		return common.Hash{}, err
 	}
 
-	return submitTransaction(s.txPool, tx, signature)
+	return submitTransaction(s.bc, s.txPool, tx, signature)
 }
 
 // PublicBlockChainAPI provides an API to access the Ethereum blockchain.
@@ -582,7 +575,7 @@ func (s *PublicBlockChainAPI) GetBlockByNumber(blockNr rpc.BlockNumber, fullTx b
 		response, err := s.rpcOutputBlock(block, true, fullTx)
 		if err == nil && blockNr == rpc.PendingBlockNumber {
 			// Pending blocks need to nil out a few fields
-			for _, field := range []string{"hash", "nonce", "logsBloom", "miner"} {
+			for _, field := range []string{"hash", "nonce", "miner"} {
 				response[field] = nil
 			}
 		}
@@ -777,7 +770,7 @@ func (s *PublicBlockChainAPI) doCall(args CallArgs, blockNr rpc.BlockNumber) (st
 	}
 
 	// Execute the call and return
-	vmenv := core.NewEnv(stateDb, s.config, s.bc, msg, block.Header(), s.config.VmConfig)
+	vmenv := core.NewEnv(stateDb, s.config, s.bc, msg, block.Header())
 	gp := new(core.GasPool).AddGas(common.MaxBig)
 
 	res, requiredGas, _, err := core.NewStateTransition(vmenv, msg, gp).TransitionDb()
@@ -821,7 +814,7 @@ func (s *PublicBlockChainAPI) rpcOutputBlock(b *types.Block, inclTx bool, fullTx
 		"gasUsed":          rpc.NewHexNumber(b.GasUsed()),
 		"timestamp":        rpc.NewHexNumber(b.Time()),
 		"transactionsRoot": b.TxHash(),
-		"receiptRoot":      b.ReceiptHash(),
+		"receiptsRoot":     b.ReceiptHash(),
 	}
 
 	if inclTx {
@@ -831,6 +824,9 @@ func (s *PublicBlockChainAPI) rpcOutputBlock(b *types.Block, inclTx bool, fullTx
 
 		if fullTx {
 			formatTx = func(tx *types.Transaction) (interface{}, error) {
+				if tx.Protected() {
+					tx.SetSigner(types.NewChainIdSigner(s.bc.Config().GetChainID()))
+				}
 				return newRPCTransaction(b, tx.Hash())
 			}
 		}
@@ -869,21 +865,32 @@ type RPCTransaction struct {
 	To               *common.Address `json:"to"`
 	TransactionIndex *rpc.HexNumber  `json:"transactionIndex"`
 	Value            *rpc.HexNumber  `json:"value"`
+	ReplayProtected  bool            `json:"replayProtected"`
+	ChainId          *big.Int        `json:"chainId,omitempty"`
 }
 
 // newRPCPendingTransaction returns a pending transaction that will serialize to the RPC representation
 func newRPCPendingTransaction(tx *types.Transaction) *RPCTransaction {
-	from, _ := tx.FromFrontier()
+	from, _ := tx.From()
+
+	var protected bool
+	var chainId *big.Int
+	if tx.Protected() {
+		protected = true
+		chainId = tx.ChainId()
+	}
 
 	return &RPCTransaction{
-		From:     from,
-		Gas:      rpc.NewHexNumber(tx.Gas()),
-		GasPrice: rpc.NewHexNumber(tx.GasPrice()),
-		Hash:     tx.Hash(),
-		Input:    fmt.Sprintf("0x%x", tx.Data()),
-		Nonce:    rpc.NewHexNumber(tx.Nonce()),
-		To:       tx.To(),
-		Value:    rpc.NewHexNumber(tx.Value()),
+		From:            from,
+		Gas:             rpc.NewHexNumber(tx.Gas()),
+		GasPrice:        rpc.NewHexNumber(tx.GasPrice()),
+		Hash:            tx.Hash(),
+		Input:           fmt.Sprintf("0x%x", tx.Data()),
+		Nonce:           rpc.NewHexNumber(tx.Nonce()),
+		To:              tx.To(),
+		Value:           rpc.NewHexNumber(tx.Value()),
+		ReplayProtected: protected,
+		ChainId:         chainId,
 	}
 }
 
@@ -891,10 +898,15 @@ func newRPCPendingTransaction(tx *types.Transaction) *RPCTransaction {
 func newRPCTransactionFromBlockIndex(b *types.Block, txIndex int) (*RPCTransaction, error) {
 	if txIndex >= 0 && txIndex < len(b.Transactions()) {
 		tx := b.Transactions()[txIndex]
-		from, err := tx.FromFrontier()
-		if err != nil {
-			return nil, err
+		var signer types.Signer = types.BasicSigner{}
+		var protected bool
+		var chainId *big.Int
+		if tx.Protected() {
+			signer = types.NewChainIdSigner(tx.ChainId())
+			protected = true
+			chainId = tx.ChainId()
 		}
+		from, _ := types.Sender(signer, tx)
 
 		return &RPCTransaction{
 			BlockHash:        b.Hash(),
@@ -908,6 +920,8 @@ func newRPCTransactionFromBlockIndex(b *types.Block, txIndex int) (*RPCTransacti
 			To:               tx.To(),
 			TransactionIndex: rpc.NewHexNumber(txIndex),
 			Value:            rpc.NewHexNumber(tx.Value()),
+			ReplayProtected:  protected,
+			ChainId:          chainId,
 		}, nil
 	}
 
@@ -962,7 +976,7 @@ func (s *PublicTransactionPoolAPI) subscriptionLoop() {
 	sub := s.eventMux.Subscribe(core.TxPreEvent{})
 	for event := range sub.Chan() {
 		tx := event.Data.(core.TxPreEvent)
-		if from, err := tx.Tx.FromFrontier(); err == nil {
+		if from, err := tx.Tx.From(); err == nil {
 			if s.am.HasAddress(from) {
 				s.muPendingTxSubs.Lock()
 				for id, sub := range s.pendingTxSubs {
@@ -1107,11 +1121,11 @@ func (s *PublicTransactionPoolAPI) GetTransactionReceipt(txHash common.Hash) (ma
 		return nil, nil
 	}
 
-	from, err := tx.FromFrontier()
-	if err != nil {
-		glog.V(logger.Debug).Infof("%v\n", err)
-		return nil, nil
+	var signer types.Signer = types.BasicSigner{}
+	if tx.Protected() {
+		signer = types.NewChainIdSigner(tx.ChainId())
 	}
+	from, _ := types.Sender(signer, tx)
 
 	fields := map[string]interface{}{
 		"root":              common.Bytes2Hex(receipt.PostState),
@@ -1141,11 +1155,13 @@ func (s *PublicTransactionPoolAPI) GetTransactionReceipt(txHash common.Hash) (ma
 
 // sign is a helper function that signs a transaction with the private key of the given address.
 func (s *PublicTransactionPoolAPI) sign(addr common.Address, tx *types.Transaction) (*types.Transaction, error) {
-	signature, err := s.am.Sign(addr, tx.SigHash().Bytes())
+	signer := s.bc.Config().GetSigner(s.bc.CurrentBlock().Number())
+
+	signature, err := s.am.Sign(addr, signer.Hash(tx).Bytes())
 	if err != nil {
 		return nil, err
 	}
-	return tx.WithSignature(signature)
+	return tx.WithSigner(signer).WithSignature(signature)
 }
 
 // SendTxArgs represents the arguments to sumbit a new transaction into the transaction pool.
@@ -1174,8 +1190,10 @@ func prepareSendTxArgs(args SendTxArgs, gpo *GasPriceOracle) SendTxArgs {
 }
 
 // submitTransaction is a helper function that submits tx to txPool and creates a log entry.
-func submitTransaction(txPool *core.TxPool, tx *types.Transaction, signature []byte) (common.Hash, error) {
-	signedTx, err := tx.WithSignature(signature)
+func submitTransaction(bc *core.BlockChain, txPool *core.TxPool, tx *types.Transaction, signature []byte) (common.Hash, error) {
+	signer := bc.Config().GetSigner(bc.CurrentBlock().Number())
+
+	signedTx, err := tx.WithSigner(signer).WithSignature(signature)
 	if err != nil {
 		return common.Hash{}, err
 	}
@@ -1215,12 +1233,15 @@ func (s *PublicTransactionPoolAPI) SendTransaction(args SendTxArgs) (common.Hash
 		tx = types.NewTransaction(args.Nonce.Uint64(), *args.To, args.Value.BigInt(), args.Gas.BigInt(), args.GasPrice.BigInt(), common.FromHex(args.Data))
 	}
 
-	signature, err := s.am.Sign(args.From, tx.SigHash().Bytes())
+	signer := s.bc.Config().GetSigner(s.bc.CurrentBlock().Number())
+	tx.SetSigner(signer)
+
+	signature, err := s.am.Sign(args.From, signer.Hash(tx).Bytes())
 	if err != nil {
 		return common.Hash{}, err
 	}
 
-	return submitTransaction(s.txPool, tx, signature)
+	return submitTransaction(s.bc, s.txPool, tx, signature)
 }
 
 // SendRawTransaction will add the signed transaction to the transaction pool.
@@ -1237,7 +1258,7 @@ func (s *PublicTransactionPoolAPI) SendRawTransaction(encodedTx string) (string,
 	}
 
 	if tx.To() == nil {
-		from, err := tx.FromFrontier()
+		from, err := tx.From()
 		if err != nil {
 			return "", err
 		}
@@ -1341,7 +1362,11 @@ type SignTransactionResult struct {
 }
 
 func newTx(t *types.Transaction) *Tx {
-	from, _ := t.FromFrontier()
+	var signer types.Signer = types.BasicSigner{}
+	if t.Protected() {
+		signer = types.NewChainIdSigner(t.ChainId())
+	}
+	from, _ := types.Sender(signer, t)
 	return &Tx{
 		tx:       t,
 		To:       t.To(),
@@ -1402,7 +1427,11 @@ func (s *PublicTransactionPoolAPI) PendingTransactions() []*RPCTransaction {
 	pending := s.txPool.GetTransactions()
 	transactions := make([]*RPCTransaction, 0, len(pending))
 	for _, tx := range pending {
-		from, _ := tx.FromFrontier()
+		var signer types.Signer = types.BasicSigner{}
+		if tx.Protected() {
+			signer = types.NewChainIdSigner(tx.ChainId())
+		}
+		from, _ := types.Sender(signer, tx)
 		if s.am.HasAddress(from) {
 			transactions = append(transactions, newRPCPendingTransaction(tx))
 		}
@@ -1441,7 +1470,12 @@ func (s *PublicTransactionPoolAPI) Resend(tx Tx, gasPrice, gasLimit *rpc.HexNumb
 
 	pending := s.txPool.GetTransactions()
 	for _, p := range pending {
-		if pFrom, err := p.FromFrontier(); err == nil && pFrom == tx.From && p.SigHash() == tx.tx.SigHash() {
+		var signer types.Signer = types.BasicSigner{}
+		if p.Protected() {
+			signer = types.NewChainIdSigner(p.ChainId())
+		}
+
+		if pFrom, err := types.Sender(signer, p); err == nil && pFrom == tx.From && signer.Hash(p) == signer.Hash(tx.tx) {
 			if gasPrice == nil {
 				gasPrice = rpc.NewHexNumber(tx.tx.GasPrice())
 			}
@@ -1575,16 +1609,30 @@ func NewPublicDebugAPI(eth *Ethereum) *PublicDebugAPI {
 }
 
 // DumpBlock retrieves the entire state of the database at a given block.
-func (api *PublicDebugAPI) DumpBlock(number uint64) (state.World, error) {
+// TODO: update to be able to dump for specific addresses?
+func (api *PublicDebugAPI) DumpBlock(number uint64) (state.Dump, error) {
 	block := api.eth.BlockChain().GetBlockByNumber(number)
 	if block == nil {
-		return state.World{}, fmt.Errorf("block #%d not found", number)
+		return state.Dump{}, fmt.Errorf("block #%d not found", number)
 	}
-	stateDb, err := state.New(block.Root(), api.eth.ChainDb())
+	stateDb, err := api.eth.BlockChain().StateAt(block.Root())
 	if err != nil {
-		return state.World{}, err
+		return state.Dump{}, err
 	}
-	return stateDb.RawDump(), nil
+	return stateDb.RawDump([]common.Address{}), nil
+}
+
+// AccountExist checks whether an address is considered exists at a given block.
+func (api *PublicDebugAPI) AccountExist(address common.Address, number uint64) (bool, error) {
+	block := api.eth.BlockChain().GetBlockByNumber(number)
+	if block == nil {
+		return false, fmt.Errorf("block #%d not found", number)
+	}
+	stateDb, err := api.eth.BlockChain().StateAt(block.Root())
+	if err != nil {
+		return false, err
+	}
+	return stateDb.Exist(address), nil
 }
 
 // GetBlockRlp retrieves the RLP encoded for of a single block.
@@ -1622,276 +1670,12 @@ func (api *PublicDebugAPI) SeedHash(number uint64) (string, error) {
 	return fmt.Sprintf("0x%x", hash), nil
 }
 
-// PrivateDebugAPI is the collection of Etheruem APIs exposed over the private
-// debugging endpoint.
-type PrivateDebugAPI struct {
-	config *core.ChainConfig
-	eth    *Ethereum
-}
-
-// NewPrivateDebugAPI creates a new API definition for the private debug methods
-// of the Ethereum service.
-func NewPrivateDebugAPI(config *core.ChainConfig, eth *Ethereum) *PrivateDebugAPI {
-	return &PrivateDebugAPI{config: config, eth: eth}
-}
-
-// ChaindbProperty returns leveldb properties of the chain database.
-func (api *PrivateDebugAPI) ChaindbProperty(property string) (string, error) {
-	ldb, ok := api.eth.chainDb.(interface {
-		LDB() *leveldb.DB
-	})
-	if !ok {
-		return "", fmt.Errorf("chaindbProperty does not work for memory databases")
-	}
-	if property == "" {
-		property = "leveldb.stats"
-	} else if !strings.HasPrefix(property, "leveldb.") {
-		property = "leveldb." + property
-	}
-	return ldb.LDB().GetProperty(property)
-}
-
-// BlockTraceResult is the returned value when replaying a block to check for
-// consensus results and full VM trace logs for all included transactions.
-type BlockTraceResult struct {
-	Validated  bool           `json:"validated"`
-	StructLogs []structLogRes `json:"structLogs"`
-	Error      string         `json:"error"`
-}
-
-// TraceBlock processes the given block's RLP but does not import the block in to
-// the chain.
-func (api *PrivateDebugAPI) TraceBlock(blockRlp []byte, config *vm.Config) BlockTraceResult {
-	var block types.Block
-	err := rlp.Decode(bytes.NewReader(blockRlp), &block)
-	if err != nil {
-		return BlockTraceResult{Error: fmt.Sprintf("could not decode block: %v", err)}
-	}
-
-	validated, logs, err := api.traceBlock(&block, config)
-	return BlockTraceResult{
-		Validated:  validated,
-		StructLogs: formatLogs(logs),
-		Error:      formatError(err),
-	}
-}
-
-// TraceBlockFromFile loads the block's RLP from the given file name and attempts to
-// process it but does not import the block in to the chain.
-func (api *PrivateDebugAPI) TraceBlockFromFile(file string, config *vm.Config) BlockTraceResult {
-	blockRlp, err := ioutil.ReadFile(file)
-	if err != nil {
-		return BlockTraceResult{Error: fmt.Sprintf("could not read file: %v", err)}
-	}
-	return api.TraceBlock(blockRlp, config)
-}
-
-// TraceBlockByNumber processes the block by canonical block number.
-func (api *PrivateDebugAPI) TraceBlockByNumber(number uint64, config *vm.Config) BlockTraceResult {
-	// Fetch the block that we aim to reprocess
-	block := api.eth.BlockChain().GetBlockByNumber(number)
-	if block == nil {
-		return BlockTraceResult{Error: fmt.Sprintf("block #%d not found", number)}
-	}
-
-	validated, logs, err := api.traceBlock(block, config)
-	return BlockTraceResult{
-		Validated:  validated,
-		StructLogs: formatLogs(logs),
-		Error:      formatError(err),
-	}
-}
-
-// TraceBlockByHash processes the block by hash.
-func (api *PrivateDebugAPI) TraceBlockByHash(hash common.Hash, config *vm.Config) BlockTraceResult {
-	// Fetch the block that we aim to reprocess
-	block := api.eth.BlockChain().GetBlock(hash)
-	if block == nil {
-		return BlockTraceResult{Error: fmt.Sprintf("block #%x not found", hash)}
-	}
-
-	validated, logs, err := api.traceBlock(block, config)
-	return BlockTraceResult{
-		Validated:  validated,
-		StructLogs: formatLogs(logs),
-		Error:      formatError(err),
-	}
-}
-
-// TraceCollector collects EVM structered logs.
-//
-// TraceCollector implements vm.Collector
-type TraceCollector struct {
-	traces []vm.StructLog
-}
-
-// AddStructLog adds a structered log.
-func (t *TraceCollector) AddStructLog(slog vm.StructLog) {
-	t.traces = append(t.traces, slog)
-}
-
-// traceBlock processes the given block but does not save the state.
-func (api *PrivateDebugAPI) traceBlock(block *types.Block, config *vm.Config) (bool, []vm.StructLog, error) {
-	// Validate and reprocess the block
-	var (
-		blockchain = api.eth.BlockChain()
-		validator  = blockchain.Validator()
-		processor  = blockchain.Processor()
-		collector  = &TraceCollector{}
-	)
-	if config == nil {
-		config = new(vm.Config)
-	}
-	config.Debug = true // make sure debug is set.
-	config.Logger.Collector = collector
-
-	if err := core.ValidateHeader(api.config, blockchain.AuxValidator(), block.Header(), blockchain.GetHeader(block.ParentHash()), true, false); err != nil {
-		return false, collector.traces, err
-	}
-	statedb, err := state.New(blockchain.GetBlock(block.ParentHash()).Root(), api.eth.ChainDb())
-	if err != nil {
-		return false, collector.traces, err
-	}
-
-	receipts, _, usedGas, err := processor.Process(block, statedb, *config)
-	if err != nil {
-		return false, collector.traces, err
-	}
-	if err := validator.ValidateState(block, blockchain.GetBlock(block.ParentHash()), statedb, receipts, usedGas); err != nil {
-		return false, collector.traces, err
-	}
-	return true, collector.traces, nil
-}
-
-// SetHead rewinds the head of the blockchain to a previous block.
-func (api *PrivateDebugAPI) SetHead(number uint64) {
-	api.eth.BlockChain().SetHead(number)
-}
-
 // ExecutionResult groups all structured logs emitted by the EVM
 // while replaying a transaction in debug mode as well as the amount of
 // gas used and the return value
 type ExecutionResult struct {
-	Gas         *big.Int       `json:"gas"`
-	ReturnValue string         `json:"returnValue"`
-	StructLogs  []structLogRes `json:"structLogs"`
-}
-
-// structLogRes stores a structured log emitted by the EVM while replaying a
-// transaction in debug mode
-type structLogRes struct {
-	Pc      uint64            `json:"pc"`
-	Op      string            `json:"op"`
-	Gas     *big.Int          `json:"gas"`
-	GasCost *big.Int          `json:"gasCost"`
-	Depth   int               `json:"depth"`
-	Error   string            `json:"error"`
-	Stack   []string          `json:"stack"`
-	Memory  []string          `json:"memory"`
-	Storage map[string]string `json:"storage"`
-}
-
-// formatLogs formats EVM returned structured logs for json output
-func formatLogs(structLogs []vm.StructLog) []structLogRes {
-	formattedStructLogs := make([]structLogRes, len(structLogs))
-	for index, trace := range structLogs {
-		formattedStructLogs[index] = structLogRes{
-			Pc:      trace.Pc,
-			Op:      trace.Op.String(),
-			Gas:     trace.Gas,
-			GasCost: trace.GasCost,
-			Depth:   trace.Depth,
-			Error:   formatError(trace.Err),
-			Stack:   make([]string, len(trace.Stack)),
-			Storage: make(map[string]string),
-		}
-
-		for i, stackValue := range trace.Stack {
-			formattedStructLogs[index].Stack[i] = fmt.Sprintf("%x", common.LeftPadBytes(stackValue.Bytes(), 32))
-		}
-
-		for i := 0; i+32 <= len(trace.Memory); i += 32 {
-			formattedStructLogs[index].Memory = append(formattedStructLogs[index].Memory, fmt.Sprintf("%x", trace.Memory[i:i+32]))
-		}
-
-		for i, storageValue := range trace.Storage {
-			formattedStructLogs[index].Storage[fmt.Sprintf("%x", i)] = fmt.Sprintf("%x", storageValue)
-		}
-	}
-	return formattedStructLogs
-}
-
-// formatError formats a Go error into either an empty string or the data content
-// of the error itself.
-func formatError(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
-}
-
-// TraceTransaction returns the structured logs created during the execution of EVM
-// and returns them as a JSON object.
-func (api *PrivateDebugAPI) TraceTransaction(txHash common.Hash, logger *vm.LogConfig) (*ExecutionResult, error) {
-	if logger == nil {
-		logger = new(vm.LogConfig)
-	}
-	// Retrieve the tx from the chain and the containing block
-	tx, blockHash, _, txIndex := core.GetTransaction(api.eth.ChainDb(), txHash)
-	if tx == nil {
-		return nil, fmt.Errorf("transaction %x not found", txHash)
-	}
-	block := api.eth.BlockChain().GetBlock(blockHash)
-	if block == nil {
-		return nil, fmt.Errorf("block %x not found", blockHash)
-	}
-	// Create the state database to mutate and eventually trace
-	parent := api.eth.BlockChain().GetBlock(block.ParentHash())
-	if parent == nil {
-		return nil, fmt.Errorf("block parent %x not found", block.ParentHash())
-	}
-	stateDb, err := state.New(parent.Root(), api.eth.ChainDb())
-	if err != nil {
-		return nil, err
-	}
-	// Mutate the state and trace the selected transaction
-	for idx, tx := range block.Transactions() {
-		// Assemble the transaction call message
-		from, err := tx.FromFrontier()
-		if err != nil {
-			return nil, fmt.Errorf("sender retrieval failed: %v", err)
-		}
-		msg := callmsg{
-			from:     stateDb.GetOrNewStateObject(from),
-			to:       tx.To(),
-			gas:      tx.Gas(),
-			gasPrice: tx.GasPrice(),
-			value:    tx.Value(),
-			data:     tx.Data(),
-		}
-		// Mutate the state if we haven't reached the tracing transaction yet
-		if uint64(idx) < txIndex {
-			vmenv := core.NewEnv(stateDb, api.config, api.eth.BlockChain(), msg, block.Header(), vm.Config{})
-			_, _, err := core.ApplyMessage(vmenv, msg, new(core.GasPool).AddGas(tx.Gas()))
-			if err != nil {
-				return nil, fmt.Errorf("mutation failed: %v", err)
-			}
-			stateDb.DeleteSuicides()
-			continue
-		}
-		// Otherwise trace the transaction and return
-		vmenv := core.NewEnv(stateDb, api.config, api.eth.BlockChain(), msg, block.Header(), vm.Config{Debug: true, Logger: *logger})
-		ret, gas, err := core.ApplyMessage(vmenv, msg, new(core.GasPool).AddGas(tx.Gas()))
-		if err != nil {
-			return nil, fmt.Errorf("tracing failed: %v", err)
-		}
-		return &ExecutionResult{
-			Gas:         gas,
-			ReturnValue: fmt.Sprintf("%x", ret),
-			StructLogs:  formatLogs(vmenv.StructLogs()),
-		}, nil
-	}
-	return nil, errors.New("database inconsistency")
+	Gas         *big.Int `json:"gas"`
+	ReturnValue string   `json:"returnValue"`
 }
 
 // TraceCall executes a call and returns the amount of gas, created logs and optionally returned values.
@@ -1926,24 +1710,21 @@ func (s *PublicBlockChainAPI) TraceCall(args CallArgs, blockNr rpc.BlockNumber) 
 		value:    args.Value.BigInt(),
 		data:     common.FromHex(args.Data),
 	}
-	if msg.gas.Cmp(common.Big0) == 0 {
+	if msg.gas.Sign() == 0 {
 		msg.gas = big.NewInt(50000000)
 	}
-	if msg.gasPrice.Cmp(common.Big0) == 0 {
+	if msg.gasPrice.Sign() == 0 {
 		msg.gasPrice = new(big.Int).Mul(big.NewInt(50), common.Shannon)
 	}
 
 	// Execute the call and return
-	vmenv := core.NewEnv(stateDb, s.config, s.bc, msg, block.Header(), vm.Config{
-		Debug: true,
-	})
+	vmenv := core.NewEnv(stateDb, s.config, s.bc, msg, block.Header())
 	gp := new(core.GasPool).AddGas(common.MaxBig)
 
 	ret, gas, err := core.ApplyMessage(vmenv, msg, gp)
 	return &ExecutionResult{
 		Gas:         gas,
 		ReturnValue: fmt.Sprintf("%x", ret),
-		StructLogs:  formatLogs(vmenv.StructLogs()),
 	}, nil
 }
 

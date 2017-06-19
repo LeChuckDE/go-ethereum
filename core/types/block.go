@@ -33,6 +33,9 @@ import (
 	"github.com/ethereumproject/go-ethereum/rlp"
 )
 
+// HeaderExtraMax is the byte size limit for Header.Extra.
+var HeaderExtraMax = 32
+
 // A BlockNonce is a 64-bit hash which proves (combined with the
 // mix-hash) that a sufficient amount of computation has been carried
 // out on a block.
@@ -65,7 +68,7 @@ type Header struct {
 	GasLimit    *big.Int       // Gas limit
 	GasUsed     *big.Int       // Gas used
 	Time        *big.Int       // Creation time
-	Extra       []byte         // Extra data
+	Extra       []byte         // Freeform descriptor
 	MixDigest   common.Hash    // for quick difficulty verification
 	Nonce       BlockNonce
 }
@@ -108,7 +111,9 @@ func (h *Header) UnmarshalJSON(data []byte) error {
 
 	h.ParentHash = common.HexToHash(ext.ParentHash)
 	h.Coinbase = common.HexToAddress(ext.Coinbase)
-	h.Difficulty = common.String2Big(ext.Difficulty)
+	if _, ok := h.Difficulty.SetString(ext.Difficulty, 0); !ok {
+		return fmt.Errorf("malformed difficulty %q", ext.Difficulty)
+	}
 	h.Time = ext.Time
 	h.Extra = []byte(ext.Extra)
 	return nil

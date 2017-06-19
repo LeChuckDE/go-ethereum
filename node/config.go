@@ -54,7 +54,7 @@ type Config struct {
 	DataDir string
 
 	// IPCPath is the requested location to place the IPC endpoint. If the path is
-	// a simple file name, it is placed inside the data directory (or on the root
+	// a simple file name, it is placed inside the chaindata directory (or on the root
 	// pipe path on Windows), whereas if it's a resolvable path name (absolute or
 	// relative), then that specific path is enforced. An empty path disables IPC.
 	IPCPath string
@@ -65,8 +65,7 @@ type Config struct {
 	// needed.
 	PrivateKey *ecdsa.PrivateKey
 
-	// Name sets the node name of this server. Use common.MakeName to create a name
-	// that follows existing conventions.
+	// Name sets the node name of this server.
 	Name string
 
 	// NoDiscovery specifies whether the peer discovery mechanism should be started
@@ -164,8 +163,8 @@ func (c *Config) IPCEndpoint() string {
 }
 
 // DefaultIPCEndpoint returns the IPC path used by default.
-func DefaultIPCEndpoint() string {
-	config := &Config{DataDir: common.DefaultDataDir(), IPCPath: common.DefaultIPCSocket}
+func DefaultIPCEndpoint(chainDir string) string {
+	config := &Config{DataDir: chainDir, IPCPath: common.DefaultIPCSocket}
 	return config.IPCEndpoint()
 }
 
@@ -178,12 +177,6 @@ func (c *Config) HTTPEndpoint() string {
 	return fmt.Sprintf("%s:%d", c.HTTPHost, c.HTTPPort)
 }
 
-// DefaultHTTPEndpoint returns the HTTP endpoint used by default.
-func DefaultHTTPEndpoint() string {
-	config := &Config{HTTPHost: common.DefaultHTTPHost, HTTPPort: common.DefaultHTTPPort}
-	return config.HTTPEndpoint()
-}
-
 // WSEndpoint resolves an websocket endpoint based on the configured host interface
 // and port parameters.
 func (c *Config) WSEndpoint() string {
@@ -191,12 +184,6 @@ func (c *Config) WSEndpoint() string {
 		return ""
 	}
 	return fmt.Sprintf("%s:%d", c.WSHost, c.WSPort)
-}
-
-// DefaultWSEndpoint returns the websocket endpoint used by default.
-func DefaultWSEndpoint() string {
-	config := &Config{WSHost: common.DefaultWSHost, WSPort: common.DefaultWSPort}
-	return config.WSEndpoint()
 }
 
 // NodeKey retrieves the currently configured private key of the node, checking

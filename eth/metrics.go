@@ -21,49 +21,6 @@ import (
 	"github.com/ethereumproject/go-ethereum/p2p"
 )
 
-var (
-	propTxnInPacketsMeter     = metrics.NewMeter("eth/prop/txns/in/packets")
-	propTxnInTrafficMeter     = metrics.NewMeter("eth/prop/txns/in/traffic")
-	propTxnOutPacketsMeter    = metrics.NewMeter("eth/prop/txns/out/packets")
-	propTxnOutTrafficMeter    = metrics.NewMeter("eth/prop/txns/out/traffic")
-	propHashInPacketsMeter    = metrics.NewMeter("eth/prop/hashes/in/packets")
-	propHashInTrafficMeter    = metrics.NewMeter("eth/prop/hashes/in/traffic")
-	propHashOutPacketsMeter   = metrics.NewMeter("eth/prop/hashes/out/packets")
-	propHashOutTrafficMeter   = metrics.NewMeter("eth/prop/hashes/out/traffic")
-	propBlockInPacketsMeter   = metrics.NewMeter("eth/prop/blocks/in/packets")
-	propBlockInTrafficMeter   = metrics.NewMeter("eth/prop/blocks/in/traffic")
-	propBlockOutPacketsMeter  = metrics.NewMeter("eth/prop/blocks/out/packets")
-	propBlockOutTrafficMeter  = metrics.NewMeter("eth/prop/blocks/out/traffic")
-	reqHashInPacketsMeter     = metrics.NewMeter("eth/req/hashes/in/packets")
-	reqHashInTrafficMeter     = metrics.NewMeter("eth/req/hashes/in/traffic")
-	reqHashOutPacketsMeter    = metrics.NewMeter("eth/req/hashes/out/packets")
-	reqHashOutTrafficMeter    = metrics.NewMeter("eth/req/hashes/out/traffic")
-	reqBlockInPacketsMeter    = metrics.NewMeter("eth/req/blocks/in/packets")
-	reqBlockInTrafficMeter    = metrics.NewMeter("eth/req/blocks/in/traffic")
-	reqBlockOutPacketsMeter   = metrics.NewMeter("eth/req/blocks/out/packets")
-	reqBlockOutTrafficMeter   = metrics.NewMeter("eth/req/blocks/out/traffic")
-	reqHeaderInPacketsMeter   = metrics.NewMeter("eth/req/headers/in/packets")
-	reqHeaderInTrafficMeter   = metrics.NewMeter("eth/req/headers/in/traffic")
-	reqHeaderOutPacketsMeter  = metrics.NewMeter("eth/req/headers/out/packets")
-	reqHeaderOutTrafficMeter  = metrics.NewMeter("eth/req/headers/out/traffic")
-	reqBodyInPacketsMeter     = metrics.NewMeter("eth/req/bodies/in/packets")
-	reqBodyInTrafficMeter     = metrics.NewMeter("eth/req/bodies/in/traffic")
-	reqBodyOutPacketsMeter    = metrics.NewMeter("eth/req/bodies/out/packets")
-	reqBodyOutTrafficMeter    = metrics.NewMeter("eth/req/bodies/out/traffic")
-	reqStateInPacketsMeter    = metrics.NewMeter("eth/req/states/in/packets")
-	reqStateInTrafficMeter    = metrics.NewMeter("eth/req/states/in/traffic")
-	reqStateOutPacketsMeter   = metrics.NewMeter("eth/req/states/out/packets")
-	reqStateOutTrafficMeter   = metrics.NewMeter("eth/req/states/out/traffic")
-	reqReceiptInPacketsMeter  = metrics.NewMeter("eth/req/receipts/in/packets")
-	reqReceiptInTrafficMeter  = metrics.NewMeter("eth/req/receipts/in/traffic")
-	reqReceiptOutPacketsMeter = metrics.NewMeter("eth/req/receipts/out/packets")
-	reqReceiptOutTrafficMeter = metrics.NewMeter("eth/req/receipts/out/traffic")
-	miscInPacketsMeter        = metrics.NewMeter("eth/misc/in/packets")
-	miscInTrafficMeter        = metrics.NewMeter("eth/misc/in/traffic")
-	miscOutPacketsMeter       = metrics.NewMeter("eth/misc/out/packets")
-	miscOutTrafficMeter       = metrics.NewMeter("eth/misc/out/traffic")
-)
-
 // meteredMsgReadWriter is a wrapper around a p2p.MsgReadWriter, capable of
 // accumulating the above defined metrics based on the data stream contents.
 type meteredMsgReadWriter struct {
@@ -74,9 +31,6 @@ type meteredMsgReadWriter struct {
 // newMeteredMsgWriter wraps a p2p MsgReadWriter with metering support. If the
 // metrics system is disabled, this function returns the original object.
 func newMeteredMsgWriter(rw p2p.MsgReadWriter) p2p.MsgReadWriter {
-	if !metrics.Enabled {
-		return rw
-	}
 	return &meteredMsgReadWriter{MsgReadWriter: rw}
 }
 
@@ -87,71 +41,54 @@ func (rw *meteredMsgReadWriter) Init(version int) {
 }
 
 func (rw *meteredMsgReadWriter) ReadMsg() (p2p.Msg, error) {
-	// Read the message and short circuit in case of an error
 	msg, err := rw.MsgReadWriter.ReadMsg()
 	if err != nil {
 		return msg, err
 	}
-	// Account for the data traffic
-	packets, traffic := miscInPacketsMeter, miscInTrafficMeter
+
+	messages, bytes := metrics.MsgMiscIn, metrics.MsgMiscInBytes
 	switch {
-	case rw.version < eth62 && msg.Code == BlockHashesMsg:
-		packets, traffic = reqHashInPacketsMeter, reqHashInTrafficMeter
-	case rw.version < eth62 && msg.Code == BlocksMsg:
-		packets, traffic = reqBlockInPacketsMeter, reqBlockInTrafficMeter
-
-	case rw.version >= eth62 && msg.Code == BlockHeadersMsg:
-		packets, traffic = reqHeaderInPacketsMeter, reqHeaderInTrafficMeter
-	case rw.version >= eth62 && msg.Code == BlockBodiesMsg:
-		packets, traffic = reqBodyInPacketsMeter, reqBodyInTrafficMeter
-
+	case msg.Code == BlockHeadersMsg:
+		messages, bytes = metrics.MsgHeaderIn, metrics.MsgHeaderInBytes
+	case msg.Code == BlockBodiesMsg:
+		messages, bytes = metrics.MsgBodyIn, metrics.MsgBodyInBytes
 	case rw.version >= eth63 && msg.Code == NodeDataMsg:
-		packets, traffic = reqStateInPacketsMeter, reqStateInTrafficMeter
+		messages, bytes = metrics.MsgStateIn, metrics.MsgStateInBytes
 	case rw.version >= eth63 && msg.Code == ReceiptsMsg:
-		packets, traffic = reqReceiptInPacketsMeter, reqReceiptInTrafficMeter
-
+		messages, bytes = metrics.MsgReceiptIn, metrics.MsgReceiptInBytes
 	case msg.Code == NewBlockHashesMsg:
-		packets, traffic = propHashInPacketsMeter, propHashInTrafficMeter
+		messages, bytes = metrics.MsgHashIn, metrics.MsgHashInBytes
 	case msg.Code == NewBlockMsg:
-		packets, traffic = propBlockInPacketsMeter, propBlockInTrafficMeter
+		messages, bytes = metrics.MsgBlockIn, metrics.MsgBlockInBytes
 	case msg.Code == TxMsg:
-		packets, traffic = propTxnInPacketsMeter, propTxnInTrafficMeter
+		messages, bytes = metrics.MsgTXNIn, metrics.MsgTXNInBytes
 	}
-	packets.Mark(1)
-	traffic.Mark(int64(msg.Size))
+	messages.Mark(1)
+	bytes.Mark(int64(msg.Size))
 
-	return msg, err
+	return msg, nil
 }
 
 func (rw *meteredMsgReadWriter) WriteMsg(msg p2p.Msg) error {
-	// Account for the data traffic
-	packets, traffic := miscOutPacketsMeter, miscOutTrafficMeter
+	messages, bytes := metrics.MsgMiscOut, metrics.MsgMiscOutBytes
 	switch {
-	case rw.version < eth62 && msg.Code == BlockHashesMsg:
-		packets, traffic = reqHashOutPacketsMeter, reqHashOutTrafficMeter
-	case rw.version < eth62 && msg.Code == BlocksMsg:
-		packets, traffic = reqBlockOutPacketsMeter, reqBlockOutTrafficMeter
-
-	case rw.version >= eth62 && msg.Code == BlockHeadersMsg:
-		packets, traffic = reqHeaderOutPacketsMeter, reqHeaderOutTrafficMeter
-	case rw.version >= eth62 && msg.Code == BlockBodiesMsg:
-		packets, traffic = reqBodyOutPacketsMeter, reqBodyOutTrafficMeter
-
+	case msg.Code == BlockHeadersMsg:
+		messages, bytes = metrics.MsgHeaderOut, metrics.MsgHeaderOutBytes
+	case msg.Code == BlockBodiesMsg:
+		messages, bytes = metrics.MsgBodyOut, metrics.MsgBodyOutBytes
 	case rw.version >= eth63 && msg.Code == NodeDataMsg:
-		packets, traffic = reqStateOutPacketsMeter, reqStateOutTrafficMeter
+		messages, bytes = metrics.MsgStateOut, metrics.MsgStateOutBytes
 	case rw.version >= eth63 && msg.Code == ReceiptsMsg:
-		packets, traffic = reqReceiptOutPacketsMeter, reqReceiptOutTrafficMeter
-
+		messages, bytes = metrics.MsgReceiptOut, metrics.MsgReceiptOutBytes
 	case msg.Code == NewBlockHashesMsg:
-		packets, traffic = propHashOutPacketsMeter, propHashOutTrafficMeter
+		messages, bytes = metrics.MsgHashOut, metrics.MsgHashOutBytes
 	case msg.Code == NewBlockMsg:
-		packets, traffic = propBlockOutPacketsMeter, propBlockOutTrafficMeter
+		messages, bytes = metrics.MsgBlockOut, metrics.MsgBlockOutBytes
 	case msg.Code == TxMsg:
-		packets, traffic = propTxnOutPacketsMeter, propTxnOutTrafficMeter
+		messages, bytes = metrics.MsgTXNOut, metrics.MsgTXNOutBytes
 	}
-	packets.Mark(1)
-	traffic.Mark(int64(msg.Size))
+	messages.Mark(1)
+	bytes.Mark(int64(msg.Size))
 
-	// Send the packet to the p2p layer
 	return rw.MsgReadWriter.WriteMsg(msg)
 }

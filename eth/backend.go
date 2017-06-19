@@ -24,8 +24,6 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strings"
 	"sync"
 	"time"
 
@@ -37,7 +35,6 @@ import (
 	"github.com/ethereumproject/go-ethereum/common/registrar/ethreg"
 	"github.com/ethereumproject/go-ethereum/core"
 	"github.com/ethereumproject/go-ethereum/core/types"
-	"github.com/ethereumproject/go-ethereum/core/vm"
 	"github.com/ethereumproject/go-ethereum/eth/downloader"
 	"github.com/ethereumproject/go-ethereum/eth/filters"
 	"github.com/ethereumproject/go-ethereum/ethdb"
@@ -59,17 +56,12 @@ const (
 	autoDAGepochHeight   = epochLength / 2
 )
 
-var (
-	datadirInUseErrnos = map[uint]bool{11: true, 32: true, 35: true}
-	portInUseErrRE     = regexp.MustCompile("address already in use")
-)
-
 type Config struct {
 	ChainConfig *core.ChainConfig // chain configuration
 
-	NetworkId int    // Network ID to use for selecting peers to connect to
-	Genesis   string // Genesis JSON to seed the chain database with
-	FastSync  bool   // Enables the state download based fast synchronisation algorithm
+	NetworkId int // Network ID to use for selecting peers to connect to
+	Genesis   *core.GenesisDump
+	FastSync  bool // Enables the state download based fast synchronisation algorithm
 
 	BlockChainVersion  int
 	SkipBcVersionCheck bool // e.g. blockchain export
@@ -81,7 +73,6 @@ type Config struct {
 	AutoDAG   bool
 	PowTest   bool
 	PowShared bool
-	ExtraData []byte
 
 	AccountManager *accounts.Manager
 	Etherbase      common.Address
@@ -95,9 +86,6 @@ type Config struct {
 	GpobaseStepDown         int
 	GpobaseStepUp           int
 	GpobaseCorrectionFactor int
-
-	EnableJit bool
-	ForceJit  bool
 
 	TestGenesisBlock *types.Block   // Genesis block to seed the chain database with (testing only!)
 	TestGenesisState ethdb.Database // Genesis state to seed the database with (testing only!)
@@ -152,9 +140,6 @@ func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) {
 	if err != nil {
 		return nil, err
 	}
-	if db, ok := chainDb.(*ethdb.LDBDatabase); ok {
-		db.Meter("eth/db/chaindata/")
-	}
 	if err := upgradeChainDatabase(chainDb); err != nil {
 		return nil, err
 	}
@@ -166,18 +151,15 @@ func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) {
 	if err != nil {
 		return nil, err
 	}
-	if db, ok := dappDb.(*ethdb.LDBDatabase); ok {
-		db.Meter("eth/db/dapp/")
-	}
-	glog.V(logger.Info).Infof("Protocol Versions: %v, Network Id: %v", ProtocolVersions, config.NetworkId)
+
+	glog.V(logger.Info).Infof("Protocol Versions: %v, Network Id: %v, Chain Id: %v", ProtocolVersions, config.NetworkId, config.ChainConfig.GetChainID())
 
 	// Load up any custom genesis block if requested
-	if len(config.Genesis) > 0 {
-		block, err := core.WriteGenesisBlock(chainDb, strings.NewReader(config.Genesis))
+	if config.Genesis != nil {
+		_, err := core.WriteGenesisBlock(chainDb, config.Genesis)
 		if err != nil {
 			return nil, err
 		}
-		glog.V(logger.Info).Infof("Successfully wrote custom genesis block: %x", block.Hash())
 	}
 
 	// Load up a test setup if directly injected
@@ -223,13 +205,13 @@ func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) {
 	}
 	switch {
 	case config.PowTest:
-		glog.V(logger.Info).Infof("ethash used in test mode")
+		glog.V(logger.Info).Infof("Consensus: ethash used in test mode")
 		eth.pow, err = ethash.NewForTesting()
 		if err != nil {
 			return nil, err
 		}
 	case config.PowShared:
-		glog.V(logger.Info).Infof("ethash used in shared mode")
+		glog.V(logger.Info).Infof("Consensus: ethash used in shared mode")
 		eth.pow = ethash.NewShared()
 
 	default:
@@ -240,23 +222,27 @@ func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) {
 	// block is prenent in the database.
 	genesis := core.GetBlock(chainDb, core.GetCanonicalHash(chainDb, 0))
 	if genesis == nil {
-		genesis, err = core.WriteDefaultGenesisBlock(chainDb)
+		genesis, err = core.WriteGenesisBlock(chainDb, core.DefaultGenesis)
 		if err != nil {
 			return nil, err
 		}
-		glog.V(logger.Info).Infoln("WARNING: Wrote default ethereum genesis block")
+		glog.V(logger.Info).Infof("Successfully wrote default ethereum mainnet genesis block: %s", genesis.Hash().Hex())
+	}
+
+	// Log genesis block information.
+	if fmt.Sprintf("%x", genesis.Hash()) == "0cd786a2425d16f152c658316c423e6ce1181e15c3295826d7c9904cba9ce303" {
+		glog.V(logger.Info).Infof("Successfully established morden testnet genesis block: \x1b[36m%s\x1b[39m", genesis.Hash().Hex())
+	} else if fmt.Sprintf("%x", genesis.Hash()) == "d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3" {
+		glog.V(logger.Info).Infof("Successfully established mainnet genesis block: \x1b[36m%s\x1b[39m", genesis.Hash().Hex())
+	} else {
+		glog.V(logger.Info).Infof("Successfully established custom genesis block: \x1b[36m%s\x1b[39m", genesis.Hash().Hex())
 	}
 
 	if config.ChainConfig == nil {
 		return nil, errors.New("missing chain config")
 	}
-	core.WriteChainConfig(chainDb, genesis.Hash(), config.ChainConfig)
 
 	eth.chainConfig = config.ChainConfig
-	eth.chainConfig.VmConfig = vm.Config{
-		EnableJit: config.EnableJit,
-		ForceJit:  config.ForceJit,
-	}
 
 	eth.blockchain, err = core.NewBlockChain(chainDb, eth.chainConfig, eth.pow, eth.EventMux())
 	if err != nil {
@@ -274,8 +260,9 @@ func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) {
 		return nil, err
 	}
 	eth.miner = miner.New(eth, eth.chainConfig, eth.EventMux(), eth.pow)
-	eth.miner.SetGasPrice(config.GasPrice)
-	eth.miner.SetExtra(config.ExtraData)
+	if err = eth.miner.SetGasPrice(config.GasPrice); err != nil {
+		return nil, err
+	}
 
 	return eth, nil
 }
@@ -343,10 +330,6 @@ func (s *Ethereum) APIs() []rpc.API {
 			Version:   "1.0",
 			Service:   NewPublicDebugAPI(s),
 			Public:    true,
-		}, {
-			Namespace: "debug",
-			Version:   "1.0",
-			Service:   NewPrivateDebugAPI(s.chainConfig, s),
 		}, {
 			Namespace: "net",
 			Version:   "1.0",
@@ -497,7 +480,7 @@ func (self *Ethereum) StopAutoDAG() {
 		close(self.autodagquit)
 		self.autodagquit = nil
 	}
-	glog.V(logger.Info).Infof("Automatic pregeneration of ethash DAG OFF (ethash dir: %s)", ethash.DefaultDir)
+	glog.V(logger.Info).Infof("Automatic pregeneration of ethash DAG: OFF (ethash dir: %s)", ethash.DefaultDir)
 }
 
 // HTTPClient returns the light http client used for fetching offchain docs

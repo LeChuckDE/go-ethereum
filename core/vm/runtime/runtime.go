@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
+// Package runtime provides a basic execution model for executing EVM code.
 package runtime
 
 import (
@@ -31,6 +32,18 @@ import (
 type ruleSet struct{}
 
 func (ruleSet) IsHomestead(*big.Int) bool { return true }
+func (ruleSet) GasTable(*big.Int) *vm.GasTable {
+	return &vm.GasTable{
+		ExtcodeSize:     big.NewInt(700),
+		ExtcodeCopy:     big.NewInt(700),
+		Balance:         big.NewInt(400),
+		SLoad:           big.NewInt(200),
+		Calls:           big.NewInt(700),
+		Suicide:         big.NewInt(5000),
+		ExpByte:         big.NewInt(10),
+		CreateBySuicide: big.NewInt(25000),
+	}
+}
 
 // Config is a basic type specifying certain configuration flags for running
 // the EVM.
@@ -104,7 +117,7 @@ func Execute(code, input []byte, cfg *Config) ([]byte, *state.StateDB, error) {
 		receiver = cfg.State.CreateAccount(common.StringToAddress("contract"))
 	)
 	// set the receiver's (the executing contract) code for execution.
-	receiver.SetCode(code)
+	receiver.SetCode(crypto.Keccak256Hash(code), code)
 
 	// Call the code with the given configuration.
 	ret, err := vmenv.Call(

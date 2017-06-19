@@ -51,9 +51,6 @@ func makeTestTrie() (ethdb.Database, *Trie, map[string][]byte) {
 	}
 	trie.Commit()
 
-	// Remove any potentially cached data from the test trie creation
-	globalCache.Clear()
-
 	// Return the generated trie
 	return db, trie, content
 }
@@ -61,9 +58,6 @@ func makeTestTrie() (ethdb.Database, *Trie, map[string][]byte) {
 // checkTrieContents cross references a reconstructed trie with an expected data
 // content map.
 func checkTrieContents(t *testing.T, db Database, root []byte, content map[string][]byte) {
-	// Remove any potentially cached data from the trie synchronisation
-	globalCache.Clear()
-
 	// Check root availability and trie contents
 	trie, err := New(common.BytesToHash(root), db)
 	if err != nil {
@@ -81,9 +75,6 @@ func checkTrieContents(t *testing.T, db Database, root []byte, content map[strin
 
 // checkTrieConsistency checks that all nodes in a trie are indeed present.
 func checkTrieConsistency(db Database, root common.Hash) error {
-	// Remove any potentially cached data from the test trie creation or previous checks
-	globalCache.Clear()
-
 	// Create and iterate a trie rooted in a subnode
 	trie, err := New(root, db)
 	if err != nil {
@@ -191,7 +182,7 @@ func testIterativeRandomTrieSync(t *testing.T, batch int) {
 	for len(queue) > 0 {
 		// Fetch all the queued nodes in a random order
 		results := make([]SyncResult, 0, len(queue))
-		for hash, _ := range queue {
+		for hash := range queue {
 			data, err := srcDb.Get(hash.Bytes())
 			if err != nil {
 				t.Fatalf("failed to retrieve node data for %x: %v", hash, err)
@@ -228,7 +219,7 @@ func TestIterativeRandomDelayedTrieSync(t *testing.T) {
 	for len(queue) > 0 {
 		// Sync only half of the scheduled nodes, even those in random order
 		results := make([]SyncResult, 0, len(queue)/2+1)
-		for hash, _ := range queue {
+		for hash := range queue {
 			data, err := srcDb.Get(hash.Bytes())
 			if err != nil {
 				t.Fatalf("failed to retrieve node data for %x: %v", hash, err)

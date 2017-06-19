@@ -17,13 +17,16 @@
 package downloader
 
 import (
+	"context"
 	"sync"
-
-	"golang.org/x/net/context"
 
 	"github.com/ethereumproject/go-ethereum/event"
 	"github.com/ethereumproject/go-ethereum/rpc"
 )
+
+type DoneEvent struct{}
+type StartEvent struct{}
+type FailedEvent struct{ Err error }
 
 // PublicDownloaderAPI provides an API which gives information about the current synchronisation status.
 // It offers only methods that operates on data that can be available to anyone without security risks.

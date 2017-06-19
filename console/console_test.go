@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
-	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,7 +31,6 @@ import (
 	"github.com/ethereumproject/go-ethereum/common"
 	"github.com/ethereumproject/go-ethereum/core"
 	"github.com/ethereumproject/go-ethereum/eth"
-	"github.com/ethereumproject/go-ethereum/internal/jsre"
 	"github.com/ethereumproject/go-ethereum/node"
 )
 
@@ -80,8 +78,6 @@ type tester struct {
 	console   *Console
 	input     *hookedPrompter
 	output    *bytes.Buffer
-
-	lastConfirm string
 }
 
 // newTester creates a test environment based on which the console can operate.
@@ -92,7 +88,10 @@ func newTester(t *testing.T, confOverride func(*eth.Config)) *tester {
 	if err != nil {
 		t.Fatalf("failed to create temporary keystore: %v", err)
 	}
-	accman := accounts.NewPlaintextManager(filepath.Join(workspace, "keystore"))
+	accman, err := accounts.NewManager(filepath.Join(workspace, "keystore"), accounts.LightScryptN, accounts.LightScryptP, false)
+	if err != nil {
+		t.Fatalf("failed to create account manager: %s", err)
+	}
 
 	// Create a networkless protocol stack and start an Ethereum service within
 	stack, err := node.New(&node.Config{DataDir: workspace, Name: testInstance, NoDiscovery: true})
@@ -100,7 +99,7 @@ func newTester(t *testing.T, confOverride func(*eth.Config)) *tester {
 		t.Fatalf("failed to create node: %v", err)
 	}
 	ethConf := &eth.Config{
-		ChainConfig:    &core.ChainConfig{HomesteadBlock: new(big.Int)},
+		ChainConfig:    core.DefaultConfig,
 		Etherbase:      common.HexToAddress(testAddress),
 		AccountManager: accman,
 		PowTest:        true,
@@ -261,11 +260,11 @@ func TestPrettyPrint(t *testing.T) {
 
 	// Define some specially formatted fields
 	var (
-		one   = jsre.NumberColor("1")
-		two   = jsre.StringColor("\"two\"")
-		three = jsre.NumberColor("3")
-		null  = jsre.SpecialColor("null")
-		fun   = jsre.FunctionColor("function()")
+		one   = "\x1b[31m1\x1b[0m"
+		two   = "\x1b[32m\"two\"\x1b[0m"
+		three = "\x1b[31m3\x1b[0m"
+		null  = "\x1b[1mnull\x1b[0m"
+		fun   = "\x1b[35mfunction()\x1b[0m"
 	)
 	// Assemble the actual output we're after and verify
 	want := `{
@@ -279,7 +278,7 @@ func TestPrettyPrint(t *testing.T) {
 }
 `
 	if output := string(tester.output.Bytes()); output != want {
-		t.Fatalf("pretty print mismatch: have %s, want %s", output, want)
+		t.Fatalf("got %q, want %q", output, want)
 	}
 }
 
@@ -289,9 +288,9 @@ func TestPrettyError(t *testing.T) {
 	defer tester.Close(t)
 	tester.console.Evaluate("throw 'hello'")
 
-	want := jsre.ErrorColor("hello") + "\n"
+	want := "\x1b[91mhello\x1b[0m\n"
 	if output := string(tester.output.Bytes()); output != want {
-		t.Fatalf("pretty error mismatch: have %s, want %s", output, want)
+		t.Fatalf("got %q, want %q", output, want)
 	}
 }
 

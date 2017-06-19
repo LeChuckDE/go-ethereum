@@ -17,16 +17,17 @@
 package rpc
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"runtime"
 	"sync/atomic"
 	"time"
 
+	"gopkg.in/fatih/set.v0"
+
 	"github.com/ethereumproject/go-ethereum/logger"
 	"github.com/ethereumproject/go-ethereum/logger/glog"
-	"golang.org/x/net/context"
-	"gopkg.in/fatih/set.v0"
 )
 
 const (
@@ -128,16 +129,6 @@ func (s *Server) RegisterName(name string, rcvr interface{}) error {
 	s.services[svc.name] = svc
 
 	return nil
-}
-
-// hasOption returns true if option is included in options, otherwise false
-func hasOption(option CodecOption, options []CodecOption) bool {
-	for _, o := range options {
-		if option == o {
-			return true
-		}
-	}
-	return false
 }
 
 // serveRequest will reads requests from the codec, calls the RPC callback and

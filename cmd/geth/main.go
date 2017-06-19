@@ -18,90 +18,61 @@
 package main
 
 import (
-	"encoding/hex"
+	"errors"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
+
+	"gopkg.in/urfave/cli.v1"
 
 	"github.com/ethereumproject/ethash"
-	"github.com/ethereumproject/go-ethereum/cmd/utils"
-	"github.com/ethereumproject/go-ethereum/common"
 	"github.com/ethereumproject/go-ethereum/console"
 	"github.com/ethereumproject/go-ethereum/core"
+	"github.com/ethereumproject/go-ethereum/core/state"
 	"github.com/ethereumproject/go-ethereum/eth"
-	"github.com/ethereumproject/go-ethereum/ethdb"
-	"github.com/ethereumproject/go-ethereum/internal/debug"
 	"github.com/ethereumproject/go-ethereum/logger"
 	"github.com/ethereumproject/go-ethereum/logger/glog"
 	"github.com/ethereumproject/go-ethereum/metrics"
 	"github.com/ethereumproject/go-ethereum/node"
-	"github.com/ethereumproject/go-ethereum/params"
-	"github.com/ethereumproject/go-ethereum/release"
-	"github.com/ethereumproject/go-ethereum/rlp"
-	"gopkg.in/urfave/cli.v1"
 )
 
-const (
-	clientIdentifier = "Geth"   // Client identifier to advertise over the network
-	versionMajor     = 1        // Major version component of the current release
-	versionMinor     = 4        // Minor version component of the current release
-	versionPatch     = 10       // Patch version component of the current release
-	versionMeta      = "stable" // Version metadata to append to the version string
+// Version is the application revision identifier. It can be set with the linker
+// as in: go build -ldflags "-X main.Version="`git describe --tags`
+var Version = "source"
 
-	versionOracle = "0xfa7b9770ca4cb04296cac84f37736d4041251cdf" // Ethereum address of the Geth release oracle
-)
-
-var (
-	gitCommit string         // Git SHA1 commit hash of the release (set via linker flags)
-	verString string         // Combined textual representation of all the version components
-	relConfig release.Config // Structured version information and release oracle config
-	app       *cli.App
-)
-
-func init() {
-	// Construct the textual version string from the individual components
-	verString = fmt.Sprintf("%d.%d.%d", versionMajor, versionMinor, versionPatch)
-	if versionMeta != "" {
-		verString += "-" + versionMeta
-	}
-	if gitCommit != "" {
-		verString += "-" + gitCommit[:8]
-	}
-	// Construct the version release oracle configuration
-	relConfig.Oracle = common.HexToAddress(versionOracle)
-
-	relConfig.Major = uint32(versionMajor)
-	relConfig.Minor = uint32(versionMinor)
-	relConfig.Patch = uint32(versionPatch)
-
-	commit, _ := hex.DecodeString(gitCommit)
-	copy(relConfig.Commit[:], commit)
-
-	// Initialize the CLI app and start Geth
-	app = utils.NewApp(verString, "the go-ethereum command line interface")
+func makeCLIApp() (app *cli.App) {
+	app = cli.NewApp()
+	app.Name = filepath.Base(os.Args[0])
+	app.Version = Version
+	app.Usage = "the go-ethereum command line interface"
 	app.Action = geth
 	app.HideVersion = true // we have a command to print the version
+
 	app.Commands = []cli.Command{
 		importCommand,
 		exportCommand,
+		dumpChainConfigCommand,
 		upgradedbCommand,
 		removedbCommand,
 		dumpCommand,
+		rollbackCommand,
 		monitorCommand,
 		accountCommand,
 		walletCommand,
 		consoleCommand,
 		attachCommand,
 		javascriptCommand,
+		statusCommand,
 		{
-			Action: makedag,
-			Name:   "makedag",
-			Usage:  "generate ethash dag (for testing)",
+			Action:  makedag,
+			Name:    "make-dag",
+			Aliases: []string{"makedag"},
+			Usage:   "Generate ethash dag (for testing)",
 			Description: `
 The makedag command generates an ethash DAG in /tmp/dag.
 
@@ -110,17 +81,19 @@ Regular users do not need to execute it.
 `,
 		},
 		{
-			Action: gpuinfo,
-			Name:   "gpuinfo",
-			Usage:  "gpuinfo",
+			Action:  gpuinfo,
+			Name:    "gpu-info",
+			Aliases: []string{"gpuinfo"},
+			Usage:   "GPU info",
 			Description: `
 Prints OpenCL device info for all found GPUs.
 `,
 		},
 		{
-			Action: gpubench,
-			Name:   "gpubench",
-			Usage:  "benchmark GPU",
+			Action:  gpubench,
+			Name:    "gpu-bench",
+			Aliases: []string{"gpubench"},
+			Usage:   "Benchmark GPU",
 			Description: `
 Runs quick benchmark on first GPU found.
 `,
@@ -128,93 +101,115 @@ Runs quick benchmark on first GPU found.
 		{
 			Action: version,
 			Name:   "version",
-			Usage:  "print ethereum version numbers",
+			Usage:  "Print ethereum version numbers",
 			Description: `
 The output of this command is supposed to be machine-readable.
-`,
-		},
-		{
-			Action: initGenesis,
-			Name:   "init",
-			Usage:  "bootstraps and initialises a new genesis block (JSON)",
-			Description: `
-The init command initialises a new genesis block and definition for the network.
-This is a destructive action and changes the network in which you will be
-participating.
 `,
 		},
 	}
 
 	app.Flags = []cli.Flag{
-		utils.IdentityFlag,
-		utils.UnlockedAccountFlag,
-		utils.PasswordFileFlag,
-		utils.BootnodesFlag,
-		utils.DataDirFlag,
-		utils.KeyStoreDirFlag,
-		utils.BlockchainVersionFlag,
-		utils.OlympicFlag,
-		utils.FastSyncFlag,
-		utils.CacheFlag,
-		utils.LightKDFFlag,
-		utils.JSpathFlag,
-		utils.ListenPortFlag,
-		utils.MaxPeersFlag,
-		utils.MaxPendingPeersFlag,
-		utils.EtherbaseFlag,
-		utils.GasPriceFlag,
-		utils.MinerThreadsFlag,
-		utils.MiningEnabledFlag,
-		utils.MiningGPUFlag,
-		utils.AutoDAGFlag,
-		utils.TargetGasLimitFlag,
-		utils.NATFlag,
-		utils.NatspecEnabledFlag,
-		utils.NoDiscoverFlag,
-		utils.NodeKeyFileFlag,
-		utils.NodeKeyHexFlag,
-		utils.RPCEnabledFlag,
-		utils.RPCListenAddrFlag,
-		utils.RPCPortFlag,
-		utils.RPCApiFlag,
-		utils.WSEnabledFlag,
-		utils.WSListenAddrFlag,
-		utils.WSPortFlag,
-		utils.WSApiFlag,
-		utils.WSAllowedOriginsFlag,
-		utils.IPCDisabledFlag,
-		utils.IPCApiFlag,
-		utils.IPCPathFlag,
-		utils.ExecFlag,
-		utils.PreloadJSFlag,
-		utils.WhisperEnabledFlag,
-		utils.DevModeFlag,
-		utils.TestNetFlag,
-		utils.VMForceJitFlag,
-		utils.VMJitCacheFlag,
-		utils.VMEnableJitFlag,
-		utils.NetworkIdFlag,
-		utils.RPCCORSDomainFlag,
-		utils.MetricsEnabledFlag,
-		utils.FakePoWFlag,
-		utils.SolcPathFlag,
-		utils.GpoMinGasPriceFlag,
-		utils.GpoMaxGasPriceFlag,
-		utils.GpoFullBlockRatioFlag,
-		utils.GpobaseStepDownFlag,
-		utils.GpobaseStepUpFlag,
-		utils.GpobaseCorrectionFactorFlag,
-		utils.ExtraDataFlag,
+		NodeNameFlag,
+		UnlockedAccountFlag,
+		PasswordFileFlag,
+		AccountsIndexFlag,
+		BootnodesFlag,
+		DataDirFlag,
+		DocRootFlag,
+		KeyStoreDirFlag,
+		ChainIdentityFlag,
+		BlockchainVersionFlag,
+		FastSyncFlag,
+		CacheFlag,
+		LightKDFFlag,
+		JSpathFlag,
+		ListenPortFlag,
+		MaxPeersFlag,
+		MaxPendingPeersFlag,
+		EtherbaseFlag,
+		GasPriceFlag,
+		MinerThreadsFlag,
+		MiningEnabledFlag,
+		MiningGPUFlag,
+		AutoDAGFlag,
+		TargetGasLimitFlag,
+		NATFlag,
+		NatspecEnabledFlag,
+		NoDiscoverFlag,
+		NodeKeyFileFlag,
+		NodeKeyHexFlag,
+		RPCEnabledFlag,
+		RPCListenAddrFlag,
+		RPCPortFlag,
+		RPCApiFlag,
+		WSEnabledFlag,
+		WSListenAddrFlag,
+		WSPortFlag,
+		WSApiFlag,
+		WSAllowedOriginsFlag,
+		IPCDisabledFlag,
+		IPCApiFlag,
+		IPCPathFlag,
+		ExecFlag,
+		PreloadJSFlag,
+		WhisperEnabledFlag,
+		DevModeFlag,
+		TestNetFlag,
+		NetworkIdFlag,
+		RPCCORSDomainFlag,
+		VerbosityFlag,
+		VModuleFlag,
+		LogDirFlag,
+		BacktraceAtFlag,
+		MetricsFlag,
+		FakePoWFlag,
+		SolcPathFlag,
+		GpoMinGasPriceFlag,
+		GpoMaxGasPriceFlag,
+		GpoFullBlockRatioFlag,
+		GpobaseStepDownFlag,
+		GpobaseStepUpFlag,
+		GpobaseCorrectionFactorFlag,
+		ExtraDataFlag,
+		Unused1,
 	}
-	app.Flags = append(app.Flags, debug.Flags...)
 
 	app.Before = func(ctx *cli.Context) error {
-		runtime.GOMAXPROCS(runtime.NumCPU())
-		if err := debug.Setup(ctx); err != nil {
-			return err
+
+		// It's a patch.
+		// Don't know why urfave/cli isn't catching the unknown command on its own.
+		if ctx.Args().Present() {
+			commandExists := false
+			for _, cmd := range app.Commands {
+				if cmd.HasName(ctx.Args().First()) {
+					commandExists = true
+				}
+			}
+			if !commandExists {
+				if e := cli.ShowCommandHelp(ctx, ctx.Args().First()); e != nil {
+					return e
+				}
+			}
 		}
-		// Start system runtime metrics collection
-		go metrics.CollectProcessMetrics(3 * time.Second)
+
+		runtime.GOMAXPROCS(runtime.NumCPU())
+
+		glog.CopyStandardLogTo("INFO")
+
+		if ctx.GlobalIsSet(aliasableName(LogDirFlag.Name, ctx)) {
+			if p := ctx.GlobalString(aliasableName(LogDirFlag.Name, ctx)); p != "" {
+				if e := os.MkdirAll(p, os.ModePerm); e != nil {
+					return e
+				}
+				glog.SetLogDir(p)
+			}
+		} else {
+			glog.SetToStderr(true) // I don't know why...
+		}
+
+		if s := ctx.String("metrics"); s != "" {
+			go metrics.Collect(s)
+		}
 
 		// This should be the only place where reporting is enabled
 		// because it is not intended to run while testing.
@@ -222,79 +217,221 @@ participating.
 		// for chains with the main network genesis block and network id 1.
 		eth.EnableBadBlockReporting = true
 
-		utils.SetupNetwork(ctx)
+		// (whilei): I use `log` instead of `glog` because git diff tells me:
+		// > The output of this command is supposed to be machine-readable.
+		gasLimit := ctx.GlobalString(aliasableName(TargetGasLimitFlag.Name, ctx))
+		if _, ok := core.TargetGasLimit.SetString(gasLimit, 0); !ok {
+			log.Fatalf("malformed %s flag value %q", aliasableName(TargetGasLimitFlag.Name, ctx), gasLimit)
+		}
+
+		// Set morden chain by default for dev mode.
+		if ctx.GlobalBool(aliasableName(DevModeFlag.Name, ctx)) {
+			if !ctx.GlobalIsSet(aliasableName(ChainIdentityFlag.Name, ctx)) {
+				if e := ctx.Set(aliasableName(ChainIdentityFlag.Name, ctx), "morden"); e != nil {
+						log.Fatalf("failed to set chain value: %v", e)
+				}
+			}
+		}
+
 		return nil
 	}
 
 	app.After = func(ctx *cli.Context) error {
 		logger.Flush()
-		debug.Exit()
 		console.Stdin.Close() // Resets terminal mode.
 		return nil
 	}
+
+	app.CommandNotFound = func(c *cli.Context, command string) {
+		fmt.Fprintf(c.App.Writer, "Invalid command: %q. Please find `geth` usage below. \n", command)
+		cli.ShowAppHelp(c)
+		os.Exit(3)
+	}
+	return app
 }
 
 func main() {
+	app := makeCLIApp()
 	if err := app.Run(os.Args); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-func makeDefaultExtra() []byte {
-	var clientInfo = struct {
-		Version   uint
-		Name      string
-		GoVersion string
-		Os        string
-	}{uint(versionMajor<<16 | versionMinor<<8 | versionPatch), clientIdentifier, runtime.Version(), runtime.GOOS}
-	extra, err := rlp.EncodeToBytes(clientInfo)
-	if err != nil {
-		glog.V(logger.Warn).Infoln("error setting canonical miner information:", err)
-	}
-
-	if uint64(len(extra)) > params.MaximumExtraDataSize.Uint64() {
-		glog.V(logger.Warn).Infoln("error setting canonical miner information: extra exceeds", params.MaximumExtraDataSize)
-		glog.V(logger.Debug).Infof("extra: %x\n", extra)
-		return nil
-	}
-	return extra
-}
-
 // geth is the main entry point into the system if no special subcommand is ran.
 // It creates a default node based on the command line arguments and runs it in
 // blocking mode, waiting for it to be shut down.
 func geth(ctx *cli.Context) error {
-	node := utils.MakeSystemNode(clientIdentifier, verString, relConfig, makeDefaultExtra(), ctx)
+	node := MakeSystemNode(Version, ctx)
 	startNode(ctx, node)
 	node.Wait()
 
 	return nil
 }
 
-// initGenesis will initialise the given JSON format genesis file and writes it as
-// the zero'd block (i.e. genesis) or will fail hard if it can't succeed.
-func initGenesis(ctx *cli.Context) error {
-	genesisPath := ctx.Args().First()
-	if len(genesisPath) == 0 {
-		utils.Fatalf("must supply path to genesis JSON file")
+func status(ctx *cli.Context) error {
+
+	shouldUseExisting := false
+	datadir := MustMakeChainDataDir(ctx)
+	chaindatadir := filepath.Join(datadir, "chaindata")
+	if di, e := os.Stat(chaindatadir); e == nil && di.IsDir() {
+		shouldUseExisting = true
+	}
+	// Makes sufficient configuration from JSON file or DB pending flags.
+	// Delegates flag usage.
+	config := mustMakeSufficientChainConfig(ctx)
+
+	// Configure the Ethereum service
+	ethConf := mustMakeEthConf(ctx, config)
+
+	// Configure node's service container.
+	name := makeNodeName(Version, ctx)
+	stackConf, _ := mustMakeStackConf(ctx, name, config)
+
+	sep := glog.Separator("-")
+	printme := []struct {
+		title   string
+		keyVals []string
+	}{
+		{"Chain configuration", formatSufficientChainConfigPretty(config)},
+		{"Ethereum configuration", formatEthConfigPretty(ethConf)},
+		{"Node configuration", formatStackConfigPretty(stackConf)},
 	}
 
-	chainDb, err := ethdb.NewLDBDatabase(filepath.Join(utils.MustMakeDataDir(ctx), "chaindata"), 0, 0)
-	if err != nil {
-		utils.Fatalf("could not open database: %v", err)
+	s := "\n"
+
+	for _, p := range printme {
+		s += withLineBreak(sep)
+		// right align category title
+		s += withLineBreak(strings.Repeat(" ", len(sep)-len(p.title)) + colorBlue(p.title))
+		for _, v := range p.keyVals {
+			s += v
+		}
+	}
+	glog.V(logger.Info).Info(s)
+
+	// Return here if database has not been initialized.
+	if !shouldUseExisting {
+		glog.V(logger.Info).Info("Geth has not been initialized; no database information available yet.")
+		return nil
 	}
 
-	genesisFile, err := os.Open(genesisPath)
-	if err != nil {
-		utils.Fatalf("failed to read genesis file: %v", err)
+	chaindata, cdb := MakeChain(ctx)
+	defer cdb.Close()
+	s = "\n"
+	s += withLineBreak(sep)
+	title := "Chain database status"
+	s += withLineBreak(strings.Repeat(" ", len(sep)-len(title)) + colorBlue(title))
+	for _, v := range formatChainDataPretty(datadir, chaindata) {
+		s += v
+	}
+	glog.V(logger.Info).Info(s)
+
+	return nil
+}
+
+func rollback(ctx *cli.Context) error {
+	index := ctx.Args().First()
+	if len(index) == 0 {
+		log.Fatal("missing argument: use `rollback 12345` to specify required block number to roll back to")
+		return errors.New("invalid flag usage")
 	}
 
-	block, err := core.WriteGenesisBlock(chainDb, genesisFile)
+	blockIndex, err := strconv.ParseUint(index, 10, 64)
 	if err != nil {
-		utils.Fatalf("failed to write genesis block: %v", err)
+		glog.Fatalf("invalid argument: use `rollback 12345`, were '12345' is a required number specifying which block number to roll back to")
+		return errors.New("invalid flag usage")
 	}
-	glog.V(logger.Info).Infof("successfully wrote genesis block and/or chain rule set: %x", block.Hash())
+
+	bc, chainDB := MakeChain(ctx)
+	defer chainDB.Close()
+
+	glog.Warning("Rolling back blockchain...")
+
+	bc.SetHead(blockIndex)
+
+	nowCurrentState := bc.CurrentBlock().Number().Uint64()
+	if nowCurrentState != blockIndex {
+		glog.Fatalf("ERROR: Wanted rollback to set head to: %v, instead current head is: %v", blockIndex, nowCurrentState)
+	} else {
+		glog.Infof("SUCCESS: Head block set to: %v", nowCurrentState)
+	}
+
+	return nil
+}
+
+// dumpChainConfig exports chain configuration based on context to JSON file.
+// It is not compatible with --chain-config flag; it is intended to move from flags -> file,
+// and not the other way around.
+func dumpChainConfig(ctx *cli.Context) error {
+
+	chainIdentity := mustMakeChainIdentity(ctx)
+	if !(chainIdentitiesMain[chainIdentity] || chainIdentitiesMorden[chainIdentity]) {
+		glog.Fatal("Dump config should only be used with default chain configurations (mainnet or morden).")
+	}
+
+	glog.V(logger.Info).Infof("Dumping configuration for: %v", chainIdentity)
+
+	chainConfigFilePath := ctx.Args().First()
+	chainConfigFilePath = filepath.Clean(chainConfigFilePath)
+
+	if chainConfigFilePath == "" || chainConfigFilePath == "/" || chainConfigFilePath == "." {
+		glog.Fatalf("Given filepath to export chain configuration was blank or invalid; it was: '%v'. It cannot be blank. You typed: %v ", chainConfigFilePath, ctx.Args().First())
+		return errors.New("invalid required filepath argument")
+	}
+
+	fb := filepath.Dir(chainConfigFilePath)
+	di, de := os.Stat(fb)
+	if de != nil {
+		if os.IsNotExist(de) {
+			glog.V(logger.Warn).Infof("Directory path '%v' does not yet exist. Will create.", fb)
+			if e := os.MkdirAll(fb, os.ModePerm); e != nil {
+				glog.Fatalf("Could not create necessary directories: %v", e)
+			}
+			di, _ = os.Stat(fb) // update var with new dir info
+		} else {
+			glog.V(logger.Error).Infof("err: %v (at '%v')", de, fb)
+		}
+	}
+	if !di.IsDir() {
+		glog.Fatalf("'%v' must be a directory", fb)
+	}
+
+	// Implicitly favor Morden because it is a smaller, simpler configuration,
+	// so I expect it to be used more frequently than mainnet.
+	genesisDump := core.TestNetGenesis
+	netId := 2
+	stateConf := &core.StateConfig{StartingNonce: state.DefaultTestnetStartingNonce}
+	if !chainIsMorden(ctx) {
+		genesisDump = core.DefaultGenesis
+		netId = eth.NetworkId
+		stateConf = nil
+	}
+
+	// Note that we use default configs (not externalizable).
+	chainConfig := MustMakeChainConfigFromDefaults(ctx)
+	var nodes []string
+	for _, node := range MakeBootstrapNodesFromContext(ctx) {
+		nodes = append(nodes, node.String())
+	}
+
+	var currentConfig = &core.SufficientChainConfig{
+		Identity:    chainIdentity,
+		Name:        mustMakeChainConfigNameDefaulty(ctx),
+		Network:     netId,
+		State:       stateConf,
+		Consensus:   "ethash",
+		Genesis:     genesisDump,
+		ChainConfig: chainConfig.SortForks(), // get current/contextualized chain config
+		Bootstrap:   nodes,
+	}
+
+	if writeError := currentConfig.WriteToJSONFile(chainConfigFilePath); writeError != nil {
+		glog.Fatalf("An error occurred while writing chain configuration: %v", writeError)
+		return writeError
+	}
+
+	glog.V(logger.Info).Info(fmt.Sprintf("Wrote chain config file to \x1b[32m%s\x1b[39m.", chainConfigFilePath))
 	return nil
 }
 
@@ -303,26 +440,18 @@ func initGenesis(ctx *cli.Context) error {
 // miner.
 func startNode(ctx *cli.Context, stack *node.Node) {
 	// Start up the node itself
-	utils.StartNode(stack)
+	StartNode(stack)
 
 	// Unlock any account specifically requested
 	var ethereum *eth.Ethereum
 	if err := stack.Service(&ethereum); err != nil {
-		utils.Fatalf("ethereum service not running: %v", err)
+		log.Fatal("ethereum service not running: ", err)
 	}
-	accman := ethereum.AccountManager()
-	passwords := utils.MakePasswordList(ctx)
 
-	accounts := strings.Split(ctx.GlobalString(utils.UnlockedAccountFlag.Name), ",")
-	for i, account := range accounts {
-		if trimmed := strings.TrimSpace(account); trimmed != "" {
-			unlockAccount(ctx, accman, trimmed, i, passwords)
-		}
-	}
 	// Start auxiliary services if enabled
-	if ctx.GlobalBool(utils.MiningEnabledFlag.Name) {
-		if err := ethereum.StartMining(ctx.GlobalInt(utils.MinerThreadsFlag.Name), ctx.GlobalString(utils.MiningGPUFlag.Name)); err != nil {
-			utils.Fatalf("Failed to start mining: %v", err)
+	if ctx.GlobalBool(aliasableName(MiningEnabledFlag.Name, ctx)) {
+		if err := ethereum.StartMining(ctx.GlobalInt(aliasableName(MinerThreadsFlag.Name, ctx)), ctx.GlobalString(aliasableName(MiningGPUFlag.Name, ctx))); err != nil {
+			log.Fatalf("Failed to start mining: %v", err)
 		}
 	}
 }
@@ -330,7 +459,7 @@ func startNode(ctx *cli.Context, stack *node.Node) {
 func makedag(ctx *cli.Context) error {
 	args := ctx.Args()
 	wrongArgs := func() {
-		utils.Fatalf(`Usage: geth makedag <block number> <outputdir>`)
+		log.Fatal(`Usage: geth makedag <block number> <outputdir>`)
 	}
 	switch {
 	case len(args) == 2:
@@ -346,7 +475,7 @@ func makedag(ctx *cli.Context) error {
 			}
 			_, err = ioutil.ReadDir(dir)
 			if err != nil {
-				utils.Fatalf("Can't find dir")
+				log.Fatal("Can't find dir")
 			}
 			fmt.Println("making DAG, this could take awhile...")
 			ethash.MakeDAG(blockNum, dir)
@@ -365,7 +494,7 @@ func gpuinfo(ctx *cli.Context) error {
 func gpubench(ctx *cli.Context) error {
 	args := ctx.Args()
 	wrongArgs := func() {
-		utils.Fatalf(`Usage: geth gpubench <gpu number>`)
+		log.Fatal(`Usage: geth gpubench <gpu number>`)
 	}
 	switch {
 	case len(args) == 1:
@@ -382,11 +511,11 @@ func gpubench(ctx *cli.Context) error {
 	return nil
 }
 
-func version(c *cli.Context) error {
-	fmt.Println(clientIdentifier)
-	fmt.Println("Version:", verString)
+func version(ctx *cli.Context) error {
+	fmt.Println("Geth")
+	fmt.Println("Version:", Version)
 	fmt.Println("Protocol Versions:", eth.ProtocolVersions)
-	fmt.Println("Network Id:", c.GlobalInt(utils.NetworkIdFlag.Name))
+	fmt.Println("Network Id:", ctx.GlobalInt(aliasableName(NetworkIdFlag.Name, ctx)))
 	fmt.Println("Go Version:", runtime.Version())
 	fmt.Println("OS:", runtime.GOOS)
 	fmt.Printf("GOPATH=%s\n", os.Getenv("GOPATH"))

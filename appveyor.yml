@@ -1,0 +1,52 @@
+platform: x64
+clone_folder: c:\gopath\src\github.com\ethereumproject\go-ethereum
+os: Visual Studio 2015
+environment:
+  GOPATH: c:\gopath
+install:
+  - set PATH=%GOPATH%\bin;c:\go\bin;C:\msys64\mingw64\bin;C:\msys64\usr\bin\;%PATH%
+  - git describe --tags --always > version.txt
+  - sed -E 's/v([[:digit:]]+\.[[:digit:]]+)\.[[:digit:]]-([[:digit:]]+)-g([a-f0-9]+)/v\1.\2+\3/' version.txt > version-app.txt
+  - sed -E 's/v([[:digit:]]+\.[[:digit:]]+)\.[[:digit:]]-([[:digit:]]+).+/v\1.\2/' version.txt > version-only.txt
+  - sed -E 's/v([[:digit:]]+\.[[:digit:]]+)\.[[:digit:]]-([[:digit:]]+).+/v\1.x/' version.txt > version-base.txt
+  - set /p VERSION=<version-app.txt
+  - set /p VERSION_ONLY=<version-only.txt
+  - set /p VERSION_BASE=<version-base.txt
+  - echo %VERSION_BASE% %VERSION_ONLY% %VERSION%
+  - echo %PATH%
+  - echo %GOPATH%
+  - go version
+  - go env
+  - go get golang.org/x/sys/windows
+build_script:
+  - go test ./...
+  - go build -ldflags "-X main.Version=%VERSION%" ./cmd/geth
+  - 7z a geth-classic-win64-%VERSION%.zip geth.exe
+artifacts:
+  - path: '*.zip'
+    name: geth
+deploy:
+  - provider: BinTray
+    username: splix
+    api_key:
+      secure: yBy4Pe1aiUnBXLheSJNzRQxvVUm+g7etLEdKDWv82XvxAup4wg2nKZ/ogTyJkWxx
+    subject: ethereumproject
+    repo: GoEthereumClassic
+    package: go-ethereum
+    version: "%VERSION_BASE%"
+    publish: true
+    override: true
+    on:
+      branch: master
+  - provider: BinTray
+    username: splix
+    api_key:
+      secure: yBy4Pe1aiUnBXLheSJNzRQxvVUm+g7etLEdKDWv82XvxAup4wg2nKZ/ogTyJkWxx
+    subject: ethereumproject
+    repo: GoEthereumClassic
+    package: go-ethereum
+    version: "%VERSION%"
+    publish: true
+    override: false
+    on:
+      appveyor_repo_tag: true

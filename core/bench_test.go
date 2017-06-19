@@ -28,7 +28,6 @@ import (
 	"github.com/ethereumproject/go-ethereum/crypto"
 	"github.com/ethereumproject/go-ethereum/ethdb"
 	"github.com/ethereumproject/go-ethereum/event"
-	"github.com/ethereumproject/go-ethereum/params"
 )
 
 func BenchmarkInsertChain_empty_memdb(b *testing.B) {
@@ -110,8 +109,8 @@ func genTxRing(naccounts int) func(int, *BlockGen) {
 	return func(i int, gen *BlockGen) {
 		gas := CalcGasLimit(gen.PrevBlock(i - 1))
 		for {
-			gas.Sub(gas, params.TxGas)
-			if gas.Cmp(params.TxGas) < 0 {
+			gas.Sub(gas, TxGas)
+			if gas.Cmp(TxGas) < 0 {
 				break
 			}
 			to := (from + 1) % naccounts
@@ -119,11 +118,11 @@ func genTxRing(naccounts int) func(int, *BlockGen) {
 				gen.TxNonce(ringAddrs[from]),
 				ringAddrs[to],
 				benchRootFunds,
-				params.TxGas,
+				TxGas,
 				nil,
 				nil,
 			)
-			tx, _ = tx.SignECDSA(ringKeys[from])
+			tx, _ = tx.WithSigner(types.BasicSigner{}).SignECDSA(ringKeys[from])
 			gen.AddTx(tx)
 			from = to
 		}
@@ -168,7 +167,7 @@ func benchInsertChain(b *testing.B, disk bool, gen func(int, *BlockGen)) {
 	// Time the insertion of the new chain.
 	// State and blocks are stored in the same DB.
 	evmux := new(event.TypeMux)
-	chainman, _ := NewBlockChain(db, &ChainConfig{HomesteadBlock: new(big.Int)}, FakePow{}, evmux)
+	chainman, _ := NewBlockChain(db, DefaultConfig, FakePow{}, evmux)
 	defer chainman.Stop()
 	b.ReportAllocs()
 	b.ResetTimer()

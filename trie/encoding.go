@@ -80,7 +80,7 @@ func compactHexEncode(nibbles []byte) []byte {
 	}
 	l := (nl + 1) / 2
 	var str = make([]byte, l)
-	for i, _ := range str {
+	for i := range str {
 		b := nibbles[i*2] * 16
 		if nl > i*2 {
 			b += nibbles[i*2+1]
@@ -116,13 +116,4 @@ func prefixLen(a, b []byte) int {
 
 func hasTerm(s []byte) bool {
 	return s[len(s)-1] == 16
-}
-
-func remTerm(s []byte) []byte {
-	if hasTerm(s) {
-		b := make([]byte, len(s)-1)
-		copy(b, s)
-		return b
-	}
-	return s
 }

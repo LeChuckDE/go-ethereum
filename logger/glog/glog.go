@@ -928,7 +928,7 @@ const flushInterval = 30 * time.Second
 
 // flushDaemon periodically flushes the log file buffers.
 func (l *loggingT) flushDaemon() {
-	for _ = range time.NewTicker(flushInterval).C {
+	for range time.NewTicker(flushInterval).C {
 		l.lockAndFlushAll()
 	}
 }
@@ -1090,6 +1090,11 @@ func (v Verbose) Infof(format string, args ...interface{}) {
 	if v {
 		logging.printfmt(infoLog, format, args...)
 	}
+}
+
+// Separator creates a line, ie ---------------------------------
+func Separator(iterable string) string {
+	return strings.Repeat(iterable, 110)
 }
 
 // Info logs to the INFO log.

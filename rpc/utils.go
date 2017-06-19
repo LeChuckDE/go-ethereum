@@ -17,6 +17,7 @@
 package rpc
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -25,8 +26,6 @@ import (
 	"reflect"
 	"unicode"
 	"unicode/utf8"
-
-	"golang.org/x/net/context"
 )
 
 // Is this an exported - upper case - name?
@@ -109,21 +108,6 @@ func isHexNum(t reflect.Type) bool {
 	}
 
 	return t == bigIntType
-}
-
-var blockNumberType = reflect.TypeOf((*BlockNumber)(nil)).Elem()
-
-// Indication if the given block is a BlockNumber
-func isBlockNumber(t reflect.Type) bool {
-	if t == nil {
-		return false
-	}
-
-	for t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-
-	return t == blockNumberType
 }
 
 // suitableCallbacks iterates over the methods of the given type. It will determine if a method satisfies the criteria

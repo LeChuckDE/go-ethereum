@@ -85,13 +85,23 @@ func NewHeaderChain(chainDb ethdb.Database, config *ChainConfig, getValidator ge
 		getValidator:  getValidator,
 	}
 
+	gen := DefaultGenesis
+	genname := "mainnet"
+	// Check if ChainConfig is mainnet or testnet and write genesis accordingly.
+	// If it's neither (custom), write default (this will be overwritten or avoided,
+	// but maintains consistent implementation.
+	if config == TestConfig {
+		gen = TestNetGenesis
+		genname = "morden testnet"
+	}
+
 	hc.genesisHeader = hc.GetHeaderByNumber(0)
 	if hc.genesisHeader == nil {
-		genesisBlock, err := WriteDefaultGenesisBlock(chainDb)
+		genesisBlock, err := WriteGenesisBlock(chainDb, gen)
 		if err != nil {
 			return nil, err
 		}
-		glog.V(logger.Info).Infoln("WARNING: Wrote default ethereum genesis block")
+		glog.V(logger.Info).Infof("WARNING: Wrote default ethereum %v genesis block", genname)
 		hc.genesisHeader = genesisBlock.Header()
 	}
 
@@ -129,6 +139,14 @@ func (hc *HeaderChain) WriteHeader(header *types.Header) (status WriteStatus, er
 	localTd := hc.GetTd(hc.currentHeaderHash)
 	externTd := new(big.Int).Add(header.Difficulty, ptd)
 
+	// Irrelevant of the canonical status, write the td and header to the database
+	if err := hc.WriteTd(hash, externTd); err != nil {
+		glog.Fatalf("failed to write header total difficulty: %v", err)
+	}
+	if err := WriteHeader(hc.chainDb, header); err != nil {
+		glog.Fatalf("failed to write header contents: %v", err)
+	}
+
 	// If the total difficulty is higher than our known, add it to the canonical chain
 	// Second clause in the if statement reduces the vulnerability to selfish mining.
 	// Please refer to http://www.cs.cornell.edu/~ie53/publications/btcProcFC.pdf
@@ -150,6 +168,7 @@ func (hc *HeaderChain) WriteHeader(header *types.Header) (status WriteStatus, er
 			headHeader = hc.GetHeader(headHash)
 			headNumber = headHeader.Number.Uint64()
 		}
+
 		// Extend the canonical chain with the new header
 		if err := WriteCanonicalHash(hc.chainDb, hash, number); err != nil {
 			glog.Fatalf("failed to insert header number: %v", err)
@@ -157,18 +176,12 @@ func (hc *HeaderChain) WriteHeader(header *types.Header) (status WriteStatus, er
 		if err := WriteHeadHeaderHash(hc.chainDb, hash); err != nil {
 			glog.Fatalf("failed to insert head header hash: %v", err)
 		}
+
 		hc.currentHeaderHash, hc.currentHeader = hash, types.CopyHeader(header)
 
 		status = CanonStatTy
 	} else {
 		status = SideStatTy
-	}
-	// Irrelevant of the canonical status, write the header itself to the database
-	if err := hc.WriteTd(hash, externTd); err != nil {
-		glog.Fatalf("failed to write header total difficulty: %v", err)
-	}
-	if err := WriteHeader(hc.chainDb, header); err != nil {
-		glog.Fatalf("failed to write header contents: %v", err)
 	}
 	hc.headerCache.Add(hash, header)
 
@@ -225,9 +238,10 @@ func (hc *HeaderChain) InsertHeaderChain(chain []*types.Header, checkFreq int, w
 			if atomic.LoadInt32(&failed) > 0 {
 				return
 			}
+
 			// Short circuit if the header is bad or already known
-			if BadHashes[hash] {
-				errs[index] = BadHashError(hash)
+			if err := hc.config.HeaderCheck(header); err != nil {
+				errs[index] = err
 				atomic.AddInt32(&failed, 1)
 				return
 			}
@@ -250,6 +264,7 @@ func (hc *HeaderChain) InsertHeaderChain(chain []*types.Header, checkFreq int, w
 			}
 		}
 	}
+
 	// Start as many worker threads as goroutines allowed
 	pending := new(sync.WaitGroup)
 	for i := 0; i < runtime.GOMAXPROCS(0); i++ {
@@ -312,7 +327,7 @@ func (hc *HeaderChain) GetBlockHashesFromHash(hash common.Hash, max uint64) []co
 			break
 		}
 		chain = append(chain, next)
-		if header.Number.Cmp(common.Big0) == 0 {
+		if header.Number.Sign() == 0 {
 			break
 		}
 	}
@@ -443,15 +458,6 @@ type headerValidator struct {
 	config *ChainConfig
 	hc     *HeaderChain // Canonical header chain
 	Pow    pow.PoW      // Proof of work used for validating
-}
-
-// NewBlockValidator returns a new block validator which is safe for re-use
-func NewHeaderValidator(config *ChainConfig, chain *HeaderChain, pow pow.PoW) HeaderValidator {
-	return &headerValidator{
-		config: config,
-		Pow:    pow,
-		hc:     chain,
-	}
 }
 
 // ValidateHeader validates the given header and, depending on the pow arg,

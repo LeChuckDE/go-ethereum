@@ -19,24 +19,30 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"math/big"
 	"os"
+	"path/filepath"
 	"runtime"
 	"time"
 
-	"github.com/ethereumproject/go-ethereum/cmd/utils"
+	"gopkg.in/urfave/cli.v1"
+
 	"github.com/ethereumproject/go-ethereum/common"
 	"github.com/ethereumproject/go-ethereum/core"
 	"github.com/ethereumproject/go-ethereum/core/state"
 	"github.com/ethereumproject/go-ethereum/core/types"
 	"github.com/ethereumproject/go-ethereum/core/vm"
+	"github.com/ethereumproject/go-ethereum/crypto"
 	"github.com/ethereumproject/go-ethereum/ethdb"
 	"github.com/ethereumproject/go-ethereum/logger/glog"
-	"gopkg.in/urfave/cli.v1"
 )
 
+// Version is the application revision identifier. It can be set with the linker
+// as in: go build -ldflags "-X main.Version="`git describe --tags`
+var Version = "unknown"
+
 var (
-	app       *cli.App
 	DebugFlag = cli.BoolFlag{
 		Name:  "debug",
 		Usage: "output full trace logs",
@@ -90,8 +96,14 @@ var (
 	}
 )
 
+var app *cli.App
+
 func init() {
-	app = utils.NewApp("0.2", "the evm command line interface")
+	app = cli.NewApp()
+	app.Name = filepath.Base(os.Args[0])
+	app.Version = Version
+	app.Usage = "the evm command line interface"
+	app.Action = run
 	app.Flags = []cli.Flag{
 		CreateFlag,
 		DebugFlag,
@@ -106,7 +118,6 @@ func init() {
 		DumpFlag,
 		InputFlag,
 	}
-	app.Action = run
 }
 
 func run(ctx *cli.Context) error {
@@ -117,11 +128,11 @@ func run(ctx *cli.Context) error {
 	statedb, _ := state.New(common.Hash{}, db)
 	sender := statedb.CreateAccount(common.StringToAddress("sender"))
 
-	vmenv := NewEnv(statedb, common.StringToAddress("evmuser"), common.Big(ctx.GlobalString(ValueFlag.Name)), vm.Config{
-		Debug:     ctx.GlobalBool(DebugFlag.Name),
-		ForceJit:  ctx.GlobalBool(ForceJitFlag.Name),
-		EnableJit: !ctx.GlobalBool(DisableJitFlag.Name),
-	})
+	valueFlag, _ := new(big.Int).SetString(ctx.GlobalString(ValueFlag.Name), 0)
+	if valueFlag == nil {
+		log.Fatalf("malformed %s flag value %q", ValueFlag.Name, ctx.GlobalString(ValueFlag.Name))
+	}
+	vmenv := NewEnv(statedb, common.StringToAddress("evmuser"), valueFlag)
 
 	tstart := time.Now()
 
@@ -130,34 +141,31 @@ func run(ctx *cli.Context) error {
 		err error
 	)
 
+	gasFlag, _ := new(big.Int).SetString(ctx.GlobalString(GasFlag.Name), 0)
+	if gasFlag == nil {
+		log.Fatalf("malformed %s flag value %q", GasFlag.Name, ctx.GlobalString(GasFlag.Name))
+	}
+	priceFlag, _ := new(big.Int).SetString(ctx.GlobalString(PriceFlag.Name), 0)
+	if priceFlag == nil {
+		log.Fatalf("malformed %s flag value %q", PriceFlag.Name, ctx.GlobalString(PriceFlag.Name))
+	}
+
 	if ctx.GlobalBool(CreateFlag.Name) {
 		input := append(common.Hex2Bytes(ctx.GlobalString(CodeFlag.Name)), common.Hex2Bytes(ctx.GlobalString(InputFlag.Name))...)
-		ret, _, err = vmenv.Create(
-			sender,
-			input,
-			common.Big(ctx.GlobalString(GasFlag.Name)),
-			common.Big(ctx.GlobalString(PriceFlag.Name)),
-			common.Big(ctx.GlobalString(ValueFlag.Name)),
-		)
+		ret, _, err = vmenv.Create(sender, input, gasFlag, priceFlag, valueFlag)
 	} else {
 		receiver := statedb.CreateAccount(common.StringToAddress("receiver"))
-		receiver.SetCode(common.Hex2Bytes(ctx.GlobalString(CodeFlag.Name)))
-		ret, err = vmenv.Call(
-			sender,
-			receiver.Address(),
-			common.Hex2Bytes(ctx.GlobalString(InputFlag.Name)),
-			common.Big(ctx.GlobalString(GasFlag.Name)),
-			common.Big(ctx.GlobalString(PriceFlag.Name)),
-			common.Big(ctx.GlobalString(ValueFlag.Name)),
-		)
+
+		code := common.Hex2Bytes(ctx.GlobalString(CodeFlag.Name))
+		receiver.SetCode(crypto.Keccak256Hash(code), code)
+		ret, err = vmenv.Call(sender, receiver.Address(), common.Hex2Bytes(ctx.GlobalString(InputFlag.Name)), gasFlag, priceFlag, valueFlag)
 	}
 	vmdone := time.Since(tstart)
 
 	if ctx.GlobalBool(DumpFlag.Name) {
 		statedb.Commit()
-		fmt.Println(string(statedb.Dump()))
+		fmt.Println(string(statedb.Dump([]common.Address{})))
 	}
-	vm.StdErrFormat(vmenv.StructLogs())
 
 	if ctx.GlobalBool(SysStatFlag.Name) {
 		var mem runtime.MemStats
@@ -197,21 +205,19 @@ type VMEnv struct {
 	depth int
 	Gas   *big.Int
 	time  *big.Int
-	logs  []vm.StructLog
 
 	evm *vm.EVM
 }
 
-func NewEnv(state *state.StateDB, transactor common.Address, value *big.Int, cfg vm.Config) *VMEnv {
+func NewEnv(state *state.StateDB, transactor common.Address, value *big.Int) *VMEnv {
 	env := &VMEnv{
 		state:      state,
 		transactor: &transactor,
 		value:      value,
 		time:       big.NewInt(time.Now().Unix()),
 	}
-	cfg.Logger.Collector = env
 
-	env.evm = vm.New(env, cfg)
+	env.evm = vm.New(env)
 	return env
 }
 
@@ -220,33 +226,40 @@ type ruleSet struct{}
 
 func (ruleSet) IsHomestead(*big.Int) bool { return true }
 
-func (self *VMEnv) RuleSet() vm.RuleSet        { return ruleSet{} }
-func (self *VMEnv) Vm() vm.Vm                  { return self.evm }
-func (self *VMEnv) Db() vm.Database            { return self.state }
-func (self *VMEnv) MakeSnapshot() vm.Database  { return self.state.Copy() }
-func (self *VMEnv) SetSnapshot(db vm.Database) { self.state.Set(db.(*state.StateDB)) }
-func (self *VMEnv) Origin() common.Address     { return *self.transactor }
-func (self *VMEnv) BlockNumber() *big.Int      { return common.Big0 }
-func (self *VMEnv) Coinbase() common.Address   { return *self.transactor }
-func (self *VMEnv) Time() *big.Int             { return self.time }
-func (self *VMEnv) Difficulty() *big.Int       { return common.Big1 }
-func (self *VMEnv) BlockHash() []byte          { return make([]byte, 32) }
-func (self *VMEnv) Value() *big.Int            { return self.value }
-func (self *VMEnv) GasLimit() *big.Int         { return big.NewInt(1000000000) }
-func (self *VMEnv) VmType() vm.Type            { return vm.StdVmTy }
-func (self *VMEnv) Depth() int                 { return 0 }
-func (self *VMEnv) SetDepth(i int)             { self.depth = i }
+func (ruleSet) GasTable(*big.Int) *vm.GasTable {
+	return &vm.GasTable{
+		ExtcodeSize:     big.NewInt(700),
+		ExtcodeCopy:     big.NewInt(700),
+		Balance:         big.NewInt(400),
+		SLoad:           big.NewInt(200),
+		Calls:           big.NewInt(700),
+		Suicide:         big.NewInt(5000),
+		ExpByte:         big.NewInt(10),
+		CreateBySuicide: big.NewInt(25000),
+	}
+}
+
+func (self *VMEnv) RuleSet() vm.RuleSet       { return ruleSet{} }
+func (self *VMEnv) Vm() vm.Vm                 { return self.evm }
+func (self *VMEnv) Db() vm.Database           { return self.state }
+func (self *VMEnv) SnapshotDatabase() int     { return self.state.Snapshot() }
+func (self *VMEnv) RevertToSnapshot(snap int) { self.state.RevertToSnapshot(snap) }
+func (self *VMEnv) Origin() common.Address    { return *self.transactor }
+func (self *VMEnv) BlockNumber() *big.Int     { return new(big.Int) }
+func (self *VMEnv) Coinbase() common.Address  { return *self.transactor }
+func (self *VMEnv) Time() *big.Int            { return self.time }
+func (self *VMEnv) Difficulty() *big.Int      { return common.Big1 }
+func (self *VMEnv) BlockHash() []byte         { return make([]byte, 32) }
+func (self *VMEnv) Value() *big.Int           { return self.value }
+func (self *VMEnv) GasLimit() *big.Int        { return big.NewInt(1000000000) }
+func (self *VMEnv) VmType() vm.Type           { return vm.StdVmTy }
+func (self *VMEnv) Depth() int                { return 0 }
+func (self *VMEnv) SetDepth(i int)            { self.depth = i }
 func (self *VMEnv) GetHash(n uint64) common.Hash {
 	if self.block.Number().Cmp(big.NewInt(int64(n))) == 0 {
 		return self.block.Hash()
 	}
 	return common.Hash{}
-}
-func (self *VMEnv) AddStructLog(log vm.StructLog) {
-	self.logs = append(self.logs, log)
-}
-func (self *VMEnv) StructLogs() []vm.StructLog {
-	return self.logs
 }
 func (self *VMEnv) AddLog(log *vm.Log) {
 	self.state.AddLog(log)

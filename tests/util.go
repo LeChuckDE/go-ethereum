@@ -20,7 +20,7 @@ import (
 	"bytes"
 	"fmt"
 	"math/big"
-	"os"
+	"strconv"
 
 	"github.com/ethereumproject/go-ethereum/common"
 	"github.com/ethereumproject/go-ethereum/core"
@@ -32,17 +32,8 @@ import (
 	"github.com/ethereumproject/go-ethereum/logger/glog"
 )
 
-var (
-	ForceJit  bool
-	EnableJit bool
-)
-
 func init() {
 	glog.SetV(0)
-	if os.Getenv("JITVM") == "true" {
-		ForceJit = true
-		EnableJit = true
-	}
 }
 
 func checkLogs(tlog []Log, logs vm.Logs) error {
@@ -103,17 +94,33 @@ func (self Log) Topics() [][]byte {
 	return t
 }
 
-func StateObjectFromAccount(db ethdb.Database, addr string, account Account) *state.StateObject {
-	obj := state.NewStateObject(common.HexToAddress(addr), db)
-	obj.SetBalance(common.Big(account.Balance))
+func makePreState(db ethdb.Database, accounts map[string]Account) *state.StateDB {
+	statedb, _ := state.New(common.Hash{}, db)
+	for addr, account := range accounts {
+		insertAccount(statedb, addr, account)
+	}
+	return statedb
+}
 
+func insertAccount(state *state.StateDB, saddr string, account Account) {
 	if common.IsHex(account.Code) {
 		account.Code = account.Code[2:]
 	}
-	obj.SetCode(common.Hex2Bytes(account.Code))
-	obj.SetNonce(common.Big(account.Nonce).Uint64())
-
-	return obj
+	addr := common.HexToAddress(saddr)
+	state.SetCode(addr, common.Hex2Bytes(account.Code))
+	if i, err := strconv.ParseUint(account.Nonce, 0, 64); err != nil {
+		panic(err)
+	} else {
+		state.SetNonce(addr, i)
+	}
+	if i, ok := new(big.Int).SetString(account.Balance, 0); !ok {
+		panic("malformed account balance")
+	} else {
+		state.SetBalance(addr, i)
+	}
+	for a, v := range account.Storage {
+		state.SetState(addr, common.HexToHash(a), common.HexToHash(v))
+	}
 }
 
 type VmEnv struct {
@@ -140,11 +147,51 @@ type VmTest struct {
 }
 
 type RuleSet struct {
-	HomesteadBlock *big.Int
+	HomesteadBlock           *big.Int
+	HomesteadGasRepriceBlock *big.Int
+	DiehardBlock             *big.Int
+	ExplosionBlock           *big.Int
 }
 
 func (r RuleSet) IsHomestead(n *big.Int) bool {
 	return n.Cmp(r.HomesteadBlock) >= 0
+}
+func (r RuleSet) GasTable(num *big.Int) *vm.GasTable {
+	if r.HomesteadGasRepriceBlock == nil || num == nil || num.Cmp(r.HomesteadGasRepriceBlock) < 0 {
+		return &vm.GasTable{
+			ExtcodeSize:     big.NewInt(20),
+			ExtcodeCopy:     big.NewInt(20),
+			Balance:         big.NewInt(20),
+			SLoad:           big.NewInt(50),
+			Calls:           big.NewInt(40),
+			Suicide:         big.NewInt(0),
+			ExpByte:         big.NewInt(10),
+			CreateBySuicide: nil,
+		}
+	}
+	if r.DiehardBlock == nil || num == nil || num.Cmp(r.DiehardBlock) < 0 {
+		return &vm.GasTable{
+			ExtcodeSize:     big.NewInt(700),
+			ExtcodeCopy:     big.NewInt(700),
+			Balance:         big.NewInt(400),
+			SLoad:           big.NewInt(200),
+			Calls:           big.NewInt(700),
+			Suicide:         big.NewInt(5000),
+			ExpByte:         big.NewInt(10),
+			CreateBySuicide: big.NewInt(25000),
+		}
+	}
+
+	return &vm.GasTable{
+		ExtcodeSize:     big.NewInt(700),
+		ExtcodeCopy:     big.NewInt(700),
+		Balance:         big.NewInt(400),
+		SLoad:           big.NewInt(200),
+		Calls:           big.NewInt(700),
+		Suicide:         big.NewInt(5000),
+		ExpByte:         big.NewInt(50),
+		CreateBySuicide: big.NewInt(25000),
+	}
 }
 
 type Env struct {
@@ -164,8 +211,6 @@ type Env struct {
 	difficulty *big.Int
 	gasLimit   *big.Int
 
-	logs []vm.StructLog
-
 	vmTest bool
 
 	evm *vm.EVM
@@ -179,30 +224,31 @@ func NewEnv(ruleSet RuleSet, state *state.StateDB) *Env {
 	return env
 }
 
-func (self *Env) StructLogs() []vm.StructLog {
-	return self.logs
-}
-
-func (self *Env) AddStructLog(log vm.StructLog) {
-	self.logs = append(self.logs, log)
-}
-
 func NewEnvFromMap(ruleSet RuleSet, state *state.StateDB, envValues map[string]string, exeValues map[string]string) *Env {
 	env := NewEnv(ruleSet, state)
 
 	env.origin = common.HexToAddress(exeValues["caller"])
 	env.parent = common.HexToHash(envValues["previousHash"])
 	env.coinbase = common.HexToAddress(envValues["currentCoinbase"])
-	env.number = common.Big(envValues["currentNumber"])
-	env.time = common.Big(envValues["currentTimestamp"])
-	env.difficulty = common.Big(envValues["currentDifficulty"])
-	env.gasLimit = common.Big(envValues["currentGasLimit"])
+	env.number, _ = new(big.Int).SetString(envValues["currentNumber"], 0)
+	if env.number == nil {
+		panic("malformed current number")
+	}
+	env.time, _ = new(big.Int).SetString(envValues["currentTimestamp"], 0)
+	if env.time == nil {
+		panic("malformed current timestamp")
+	}
+	env.difficulty, _ = new(big.Int).SetString(envValues["currentDifficulty"], 0)
+	if env.difficulty == nil {
+		panic("malformed current difficulty")
+	}
+	env.gasLimit, _ = new(big.Int).SetString(envValues["currentGasLimit"], 0)
+	if env.gasLimit == nil {
+		panic("malformed current gas limit")
+	}
 	env.Gas = new(big.Int)
 
-	env.evm = vm.New(env, vm.Config{
-		EnableJit: EnableJit,
-		ForceJit:  ForceJit,
-	})
+	env.evm = vm.New(env)
 
 	return env
 }
@@ -235,11 +281,11 @@ func (self *Env) CanTransfer(from common.Address, balance *big.Int) bool {
 
 	return self.state.GetBalance(from).Cmp(balance) >= 0
 }
-func (self *Env) MakeSnapshot() vm.Database {
-	return self.state.Copy()
+func (self *Env) SnapshotDatabase() int {
+	return self.state.Snapshot()
 }
-func (self *Env) SetSnapshot(copy vm.Database) {
-	self.state.Set(copy.(*state.StateDB))
+func (self *Env) RevertToSnapshot(snapshot int) {
+	self.state.RevertToSnapshot(snapshot)
 }
 
 func (self *Env) Transfer(from, to vm.Account, amount *big.Int) {

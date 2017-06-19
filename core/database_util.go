@@ -19,7 +19,6 @@ package core
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"math/big"
 
@@ -51,8 +50,6 @@ var (
 	MIPMapLevels = []uint64{1000000, 500000, 100000, 50000, 1000}
 
 	blockHashPrefix = []byte("block-hash-") // [deprecated by the header/block split, remove eventually]
-
-	configPrefix = []byte("ethereum-config-") // config prefix for the db
 )
 
 // GetCanonicalHash retrieves a hash assigned to a canonical block number.
@@ -157,7 +154,11 @@ func GetTd(db ethdb.Database, hash common.Hash) *big.Int {
 }
 
 // GetBlock retrieves an entire block corresponding to the hash, assembling it
-// back from the stored header and body.
+// back from the stored header and body. If either the header or body could not
+// be retrieved nil is returned.
+//
+// Note, due to concurrent download of header and block body the header and thus
+// canonical hash can be stored in the database but the body data not (yet).
 func GetBlock(db ethdb.Database, hash common.Hash) *types.Block {
 	// Retrieve the block header and body contents
 	header := GetHeader(db, hash)
@@ -529,35 +530,4 @@ func GetBlockChainVersion(db ethdb.Database) int {
 func WriteBlockChainVersion(db ethdb.Database, vsn int) {
 	enc, _ := rlp.EncodeToBytes(uint(vsn))
 	db.Put([]byte("BlockchainVersion"), enc)
-}
-
-// WriteChainConfig writes the chain config settings to the database.
-func WriteChainConfig(db ethdb.Database, hash common.Hash, cfg *ChainConfig) error {
-	// short circuit and ignore if nil config. GetChainConfig
-	// will return a default.
-	if cfg == nil {
-		return nil
-	}
-
-	jsonChainConfig, err := json.Marshal(cfg)
-	if err != nil {
-		return err
-	}
-
-	return db.Put(append(configPrefix, hash[:]...), jsonChainConfig)
-}
-
-// GetChainConfig will fetch the network settings based on the given hash.
-func GetChainConfig(db ethdb.Database, hash common.Hash) (*ChainConfig, error) {
-	jsonChainConfig, _ := db.Get(append(configPrefix, hash[:]...))
-	if len(jsonChainConfig) == 0 {
-		return nil, ChainConfigNotFoundErr
-	}
-
-	var config ChainConfig
-	if err := json.Unmarshal(jsonChainConfig, &config); err != nil {
-		return nil, err
-	}
-
-	return &config, nil
 }

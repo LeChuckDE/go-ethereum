@@ -29,7 +29,6 @@ import (
 	"github.com/ethereumproject/go-ethereum/core/vm"
 	"github.com/ethereumproject/go-ethereum/ethdb"
 	"github.com/ethereumproject/go-ethereum/logger/glog"
-	"github.com/ethereumproject/go-ethereum/params"
 )
 
 func RunVmTestWithReader(r io.Reader, skipTests []string) error {
@@ -80,16 +79,6 @@ func BenchVmTest(p string, conf bconf, b *testing.B) error {
 		env["currentTimestamp"] = test.Env.CurrentTimestamp.(string)
 	}
 
-	/*
-		if conf.precomp {
-			program := vm.NewProgram(test.code)
-			err := vm.AttachProgram(program)
-			if err != nil {
-				return err
-			}
-		}
-	*/
-
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		benchVmTest(test, env, b)
@@ -101,14 +90,7 @@ func BenchVmTest(p string, conf bconf, b *testing.B) error {
 func benchVmTest(test VmTest, env map[string]string, b *testing.B) {
 	b.StopTimer()
 	db, _ := ethdb.NewMemDatabase()
-	statedb, _ := state.New(common.Hash{}, db)
-	for addr, account := range test.Pre {
-		obj := StateObjectFromAccount(db, addr, account)
-		statedb.SetStateObject(obj)
-		for a, v := range account.Storage {
-			obj.SetState(common.HexToHash(a), common.HexToHash(v))
-		}
-	}
+	statedb := makePreState(db, test.Pre)
 	b.StartTimer()
 
 	RunVm(statedb, env, test.Exec)
@@ -152,14 +134,7 @@ func runVmTests(tests map[string]VmTest, skipTests []string) error {
 
 func runVmTest(test VmTest) error {
 	db, _ := ethdb.NewMemDatabase()
-	statedb, _ := state.New(common.Hash{}, db)
-	for addr, account := range test.Pre {
-		obj := StateObjectFromAccount(db, addr, account)
-		statedb.SetStateObject(obj)
-		for a, v := range account.Storage {
-			obj.SetState(common.HexToHash(a), common.HexToHash(v))
-		}
-	}
+	statedb := makePreState(db, test.Pre)
 
 	// XXX Yeah, yeah...
 	env := make(map[string]string)
@@ -174,14 +149,7 @@ func runVmTest(test VmTest) error {
 		env["currentTimestamp"] = test.Env.CurrentTimestamp.(string)
 	}
 
-	var (
-		ret  []byte
-		gas  *big.Int
-		err  error
-		logs vm.Logs
-	)
-
-	ret, logs, gas, err = RunVm(statedb, env, test.Exec)
+	ret, logs, gas, err := RunVm(statedb, env, test.Exec)
 
 	// Compare expected and actual return
 	rexp := common.FromHex(test.Out)
@@ -190,12 +158,17 @@ func runVmTest(test VmTest) error {
 	}
 
 	// Check gas usage
-	if len(test.Gas) == 0 && err == nil {
+	if test.Gas == "" && err == nil {
 		return fmt.Errorf("gas unspecified, indicating an error. VM returned (incorrectly) successfull")
 	} else {
-		gexp := common.Big(test.Gas)
-		if gexp.Cmp(gas) != 0 {
-			return fmt.Errorf("gas failed. Expected %v, got %v\n", gexp, gas)
+		want, ok := new(big.Int).SetString(test.Gas, 0)
+		if test.Gas == "" {
+			want = new(big.Int)
+		} else if !ok {
+			return fmt.Errorf("malformed test gas %q", test.Gas)
+		}
+		if want.Cmp(gas) != 0 {
+			return fmt.Errorf("gas failed. Expected %v, got %v\n", want, gas)
 		}
 	}
 
@@ -205,11 +178,9 @@ func runVmTest(test VmTest) error {
 		if obj == nil {
 			continue
 		}
-
 		for addr, value := range account.Storage {
-			v := obj.GetState(common.HexToHash(addr))
+			v := statedb.GetState(obj.Address(), common.HexToHash(addr))
 			vexp := common.HexToHash(value)
-
 			if v != vexp {
 				return fmt.Errorf("(%x: %s) storage failed. Expected %x, got %x (%v %v)\n", obj.Address().Bytes()[0:4], addr, vexp, v, vexp.Big(), v.Big())
 			}
@@ -229,19 +200,27 @@ func runVmTest(test VmTest) error {
 
 func RunVm(state *state.StateDB, env, exec map[string]string) ([]byte, vm.Logs, *big.Int, error) {
 	var (
-		to    = common.HexToAddress(exec["address"])
-		from  = common.HexToAddress(exec["caller"])
-		data  = common.FromHex(exec["data"])
-		gas   = common.Big(exec["gas"])
-		price = common.Big(exec["gasPrice"])
-		value = common.Big(exec["value"])
+		to       = common.HexToAddress(exec["address"])
+		from     = common.HexToAddress(exec["caller"])
+		data     = common.FromHex(exec["data"])
+		gas, _   = new(big.Int).SetString(exec["gas"], 0)
+		price, _ = new(big.Int).SetString(exec["gasPrice"], 0)
+		value, _ = new(big.Int).SetString(exec["value"], 0)
 	)
+	if gas == nil || price == nil || value == nil {
+		panic("malformed gas, price or value")
+	}
 	// Reset the pre-compiled contracts for VM tests.
 	vm.Precompiled = make(map[string]*vm.PrecompiledAccount)
 
 	caller := state.GetOrNewStateObject(from)
 
-	vmenv := NewEnvFromMap(RuleSet{params.MainNetHomesteadBlock}, state, env, exec)
+	vmenv := NewEnvFromMap(RuleSet{
+		HomesteadBlock:           big.NewInt(1150000),
+		HomesteadGasRepriceBlock: big.NewInt(2500000),
+		DiehardBlock:             big.NewInt(3000000),
+		ExplosionBlock:           big.NewInt(5000000),
+	}, state, env, exec)
 	vmenv.vmTest = true
 	vmenv.skipTransfer = true
 	vmenv.initial = true

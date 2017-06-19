@@ -17,11 +17,9 @@
 package vm
 
 import (
-	"math"
 	"math/big"
 
 	"github.com/ethereumproject/go-ethereum/common"
-	"github.com/ethereumproject/go-ethereum/params"
 )
 
 // Type is the VM type accepted by **NewVm**
@@ -39,16 +37,13 @@ var (
 	U256 = common.U256 // Shortcut to common.U256
 	S256 = common.S256 // Shortcut to common.S256
 
-	Zero = common.Big0 // Shortcut to common.Big0
-	One  = common.Big1 // Shortcut to common.Big1
-
-	max = big.NewInt(math.MaxInt64) // Maximum 64 bit integer
+	One = common.Big1 // Shortcut to common.Big1
 )
 
 // calculates the memory size required for a step
 func calcMemSize(off, l *big.Int) *big.Int {
-	if l.Cmp(common.Big0) == 0 {
-		return common.Big0
+	if l.Sign() == 0 {
+		return new(big.Int)
 	}
 
 	return new(big.Int).Add(off, l)
@@ -56,7 +51,7 @@ func calcMemSize(off, l *big.Int) *big.Int {
 
 // calculates the quadratic gas
 func quadMemGas(mem *Memory, newMemSize, gas *big.Int) {
-	if newMemSize.Cmp(common.Big0) > 0 {
+	if newMemSize.Sign() > 0 {
 		newMemSizeWords := toWordSize(newMemSize)
 		newMemSize.Mul(newMemSizeWords, u256(32))
 
@@ -64,14 +59,14 @@ func quadMemGas(mem *Memory, newMemSize, gas *big.Int) {
 			// be careful reusing variables here when changing.
 			// The order has been optimised to reduce allocation
 			oldSize := toWordSize(big.NewInt(int64(mem.Len())))
-			pow := new(big.Int).Exp(oldSize, common.Big2, Zero)
-			linCoef := oldSize.Mul(oldSize, params.MemoryGas)
-			quadCoef := new(big.Int).Div(pow, params.QuadCoeffDiv)
+			pow := new(big.Int).Exp(oldSize, common.Big2, new(big.Int))
+			linCoef := oldSize.Mul(oldSize, big.NewInt(3))
+			quadCoef := new(big.Int).Div(pow, big.NewInt(512))
 			oldTotalFee := new(big.Int).Add(linCoef, quadCoef)
 
-			pow.Exp(newMemSizeWords, common.Big2, Zero)
-			linCoef = linCoef.Mul(newMemSizeWords, params.MemoryGas)
-			quadCoef = quadCoef.Div(pow, params.QuadCoeffDiv)
+			pow.Exp(newMemSizeWords, common.Big2, new(big.Int))
+			linCoef = linCoef.Mul(newMemSizeWords, big.NewInt(3))
+			quadCoef = quadCoef.Div(pow, big.NewInt(512))
 			newTotalFee := linCoef.Add(linCoef, quadCoef)
 
 			fee := newTotalFee.Sub(newTotalFee, oldTotalFee)
@@ -83,17 +78,6 @@ func quadMemGas(mem *Memory, newMemSize, gas *big.Int) {
 // Simple helper
 func u256(n int64) *big.Int {
 	return big.NewInt(n)
-}
-
-// Mainly used for print variables and passing to Print*
-func toValue(val *big.Int) interface{} {
-	// Let's assume a string on right padded zero's
-	b := val.Bytes()
-	if b[0] != 0 && b[len(b)-1] == 0x0 && b[len(b)-2] == 0x0 {
-		return string(b)
-	}
-
-	return val
 }
 
 // getData returns a slice from the data based on the start and size and pads

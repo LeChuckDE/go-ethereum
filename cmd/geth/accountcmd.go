@@ -19,9 +19,9 @@ package main
 import (
 	"fmt"
 	"io/ioutil"
+	"log"
 
 	"github.com/ethereumproject/go-ethereum/accounts"
-	"github.com/ethereumproject/go-ethereum/cmd/utils"
 	"github.com/ethereumproject/go-ethereum/console"
 	"github.com/ethereumproject/go-ethereum/crypto"
 	"github.com/ethereumproject/go-ethereum/logger"
@@ -30,9 +30,13 @@ import (
 )
 
 var (
+	AccountsIndexFlag = cli.BoolFlag{
+		Name: "index-accounts,indexaccounts",
+		Usage: "Enable key-value db store for indexing large amounts of key files",
+	}
 	walletCommand = cli.Command{
 		Name:  "wallet",
-		Usage: "ethereum presale wallet",
+		Usage: "Ethereum presale wallet",
 		Subcommands: []cli.Command{
 			{
 				Action: importWallet,
@@ -52,7 +56,7 @@ passwordfile as argument containing the wallet password in plaintext.
 	accountCommand = cli.Command{
 		Action: accountList,
 		Name:   "account",
-		Usage:  "manage accounts",
+		Usage:  "Manage accounts",
 		Description: `
 
 Manage accounts lets you create new accounts, list all existing accounts,
@@ -88,15 +92,15 @@ And finally. DO NOT FORGET YOUR PASSWORD.
 			{
 				Action: accountList,
 				Name:   "list",
-				Usage:  "print account addresses",
+				Usage:  "Print account addresses",
 			},
 			{
 				Action: accountCreate,
 				Name:   "new",
-				Usage:  "create a new account",
+				Usage:  "Create a new account",
 				Description: `
 
-    ethereum account new
+    geth account new
 
 Creates a new account. Prints the address.
 
@@ -115,10 +119,10 @@ password to file or expose in any other way.
 			{
 				Action: accountUpdate,
 				Name:   "update",
-				Usage:  "update an existing account",
+				Usage:  "Update an existing account",
 				Description: `
 
-    ethereum account update <address>
+    geth account update <address>
 
 Update an existing account.
 
@@ -130,7 +134,7 @@ format to the newest format or change the password for an account.
 
 For non-interactive use the passphrase can be specified with the --password flag:
 
-    ethereum --password <passwordfile> account update <address>
+    geth --password <passwordfile> account update <address>
 
 Since only one password can be given, only format update can be performed,
 changing your password is only possible interactively.
@@ -139,10 +143,10 @@ changing your password is only possible interactively.
 			{
 				Action: accountImport,
 				Name:   "import",
-				Usage:  "import a private key into a new account",
+				Usage:  "Import a private key into a new account",
 				Description: `
 
-    ethereum account import <keyfile>
+    geth account import <keyfile>
 
 Imports an unencrypted private key from <keyfile> and creates a new account.
 Prints the address.
@@ -155,7 +159,7 @@ You must remember this passphrase to unlock your account in the future.
 
 For non-interactive use the passphrase can be specified with the -password flag:
 
-    ethereum --password <passwordfile> account import <keyfile>
+    geth --password <passwordfile> account import <keyfile>
 
 Note:
 As you can directly copy your encrypted accounts to another ethereum instance,
@@ -163,13 +167,49 @@ this import mechanism is not needed when you transfer an account between
 nodes.
 					`,
 			},
+			{
+				Action: accountIndex,
+				Name:   "index",
+				Usage:  "Build persistent account index",
+				Description: `
+
+    geth --index-accounts account index
+
+Create keystore directory index cache database (keystore/accounts.db). Relevant for use with large amounts of key files (>10,000).
+
+While idempotent, this command is only designed to segregate work and setup time for initial index creation.
+
+It is only useful to run once when it's your first time using '--index-accounts' flag option, and MUST be run in conjunction
+with that option.
+
+It indexes all key files from keystore/* (non-recursively).
+					`,
+			},
 		},
 	}
 )
 
+func accountIndex(ctx *cli.Context) error {
+	n := aliasableName(AccountsIndexFlag.Name, ctx)
+	if !ctx.GlobalBool(n) {
+		log.Fatalf("Use: $ geth --%v account index\n (missing '%v' flag)", n, n)
+	}
+	am := MakeAccountManager(ctx)
+	errs := am.BuildIndexDB()
+	if len(errs) > 0 {
+		for _, e := range errs {
+			if e != nil {
+				glog.V(logger.Error).Infof("init cache db err: %v", e)
+			}
+		}
+	}
+	return nil
+}
+
 func accountList(ctx *cli.Context) error {
-	accman := utils.MakeAccountManager(ctx)
+	accman := MakeAccountManager(ctx)
 	for i, acct := range accman.Accounts() {
+
 		fmt.Printf("Account #%d: {%x} %s\n", i, acct.Address, acct.File)
 	}
 	return nil
@@ -177,9 +217,9 @@ func accountList(ctx *cli.Context) error {
 
 // tries unlocking the specified account a few times.
 func unlockAccount(ctx *cli.Context, accman *accounts.Manager, address string, i int, passwords []string) (accounts.Account, string) {
-	account, err := utils.MakeAddress(accman, address)
+	account, err := MakeAddress(accman, address)
 	if err != nil {
-		utils.Fatalf("Could not list accounts: %v", err)
+		log.Fatal("Could not list accounts: ", err)
 	}
 	for trials := 0; trials < 3; trials++ {
 		prompt := fmt.Sprintf("Unlocking account %s | Attempt %d/%d", address, trials+1, 3)
@@ -199,7 +239,7 @@ func unlockAccount(ctx *cli.Context, accman *accounts.Manager, address string, i
 		}
 	}
 	// All trials expended to unlock account, bail out
-	utils.Fatalf("Failed to unlock account %s (%v)", address, err)
+	log.Fatalf("Failed to unlock account %s (%v)", address, err)
 	return accounts.Account{}, ""
 }
 
@@ -219,15 +259,15 @@ func getPassPhrase(prompt string, confirmation bool, i int, passwords []string) 
 	}
 	password, err := console.Stdin.PromptPassword("Passphrase: ")
 	if err != nil {
-		utils.Fatalf("Failed to read passphrase: %v", err)
+		log.Fatal("Failed to read passphrase: ", err)
 	}
 	if confirmation {
 		confirm, err := console.Stdin.PromptPassword("Repeat passphrase: ")
 		if err != nil {
-			utils.Fatalf("Failed to read passphrase confirmation: %v", err)
+			log.Fatalf("Failed to read passphrase confirmation: ", err)
 		}
 		if password != confirm {
-			utils.Fatalf("Passphrases do not match")
+			log.Fatal("Passphrases do not match")
 		}
 	}
 	return password
@@ -247,7 +287,7 @@ func ambiguousAddrRecovery(am *accounts.Manager, err *accounts.AmbiguousAddrErro
 		}
 	}
 	if match == nil {
-		utils.Fatalf("None of the listed files could be unlocked.")
+		log.Fatal("None of the listed files could be unlocked.")
 	}
 	fmt.Printf("Your passphrase unlocked %s\n", match.File)
 	fmt.Println("In order to avoid this warning, you need to remove the following duplicate key files:")
@@ -261,12 +301,12 @@ func ambiguousAddrRecovery(am *accounts.Manager, err *accounts.AmbiguousAddrErro
 
 // accountCreate creates a new account into the keystore defined by the CLI flags.
 func accountCreate(ctx *cli.Context) error {
-	accman := utils.MakeAccountManager(ctx)
-	password := getPassPhrase("Your new account is locked with a password. Please give a password. Do not forget this password.", true, 0, utils.MakePasswordList(ctx))
+	accman := MakeAccountManager(ctx)
+	password := getPassPhrase("Your new account is locked with a password. Please give a password. Do not forget this password.", true, 0, MakePasswordList(ctx))
 
 	account, err := accman.NewAccount(password)
 	if err != nil {
-		utils.Fatalf("Failed to create account: %v", err)
+		log.Fatal("Failed to create account: ", err)
 	}
 	fmt.Printf("Address: {%x}\n", account.Address)
 	return nil
@@ -276,14 +316,14 @@ func accountCreate(ctx *cli.Context) error {
 // one, also providing the possibility to change the pass-phrase.
 func accountUpdate(ctx *cli.Context) error {
 	if len(ctx.Args()) == 0 {
-		utils.Fatalf("No accounts specified to update")
+		log.Fatal("No accounts specified to update")
 	}
-	accman := utils.MakeAccountManager(ctx)
+	accman := MakeAccountManager(ctx)
 
 	account, oldPassword := unlockAccount(ctx, accman, ctx.Args().First(), 0, nil)
 	newPassword := getPassPhrase("Please give a new password. Do not forget this password.", true, 0, nil)
 	if err := accman.Update(account, oldPassword, newPassword); err != nil {
-		utils.Fatalf("Could not update the account: %v", err)
+		log.Fatal("Could not update the account: ", err)
 	}
 	return nil
 }
@@ -291,19 +331,18 @@ func accountUpdate(ctx *cli.Context) error {
 func importWallet(ctx *cli.Context) error {
 	keyfile := ctx.Args().First()
 	if len(keyfile) == 0 {
-		utils.Fatalf("keyfile must be given as argument")
+		log.Fatal("keyfile must be given as argument")
 	}
 	keyJson, err := ioutil.ReadFile(keyfile)
 	if err != nil {
-		utils.Fatalf("Could not read wallet file: %v", err)
+		log.Fatal("Could not read wallet file: ", err)
 	}
-
-	accman := utils.MakeAccountManager(ctx)
-	passphrase := getPassPhrase("", false, 0, utils.MakePasswordList(ctx))
+	accman := MakeAccountManager(ctx)
+	passphrase := getPassPhrase("", false, 0, MakePasswordList(ctx))
 
 	acct, err := accman.ImportPreSaleKey(keyJson, passphrase)
 	if err != nil {
-		utils.Fatalf("%v", err)
+		log.Fatal(err)
 	}
 	fmt.Printf("Address: {%x}\n", acct.Address)
 	return nil
@@ -312,17 +351,17 @@ func importWallet(ctx *cli.Context) error {
 func accountImport(ctx *cli.Context) error {
 	keyfile := ctx.Args().First()
 	if len(keyfile) == 0 {
-		utils.Fatalf("keyfile must be given as argument")
+		log.Fatal("keyfile must be given as argument")
 	}
 	key, err := crypto.LoadECDSA(keyfile)
 	if err != nil {
-		utils.Fatalf("keyfile must be given as argument")
+		log.Fatal("keyfile must be given as argument")
 	}
-	accman := utils.MakeAccountManager(ctx)
-	passphrase := getPassPhrase("Your new account is locked with a password. Please give a password. Do not forget this password.", true, 0, utils.MakePasswordList(ctx))
+	accman := MakeAccountManager(ctx)
+	passphrase := getPassPhrase("Your new account is locked with a password. Please give a password. Do not forget this password.", true, 0, MakePasswordList(ctx))
 	acct, err := accman.ImportECDSA(key, passphrase)
 	if err != nil {
-		utils.Fatalf("Could not create the account: %v", err)
+		log.Fatal("Could not create the account: ", err)
 	}
 	fmt.Printf("Address: {%x}\n", acct.Address)
 	return nil

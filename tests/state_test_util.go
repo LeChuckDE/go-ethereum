@@ -95,14 +95,7 @@ func BenchStateTest(ruleSet RuleSet, p string, conf bconf, b *testing.B) error {
 func benchStateTest(ruleSet RuleSet, test VmTest, env map[string]string, b *testing.B) {
 	b.StopTimer()
 	db, _ := ethdb.NewMemDatabase()
-	statedb, _ := state.New(common.Hash{}, db)
-	for addr, account := range test.Pre {
-		obj := StateObjectFromAccount(db, addr, account)
-		statedb.SetStateObject(obj)
-		for a, v := range account.Storage {
-			obj.SetState(common.HexToHash(a), common.HexToHash(v))
-		}
-	}
+	statedb := makePreState(db, test.Pre)
 	b.StartTimer()
 
 	RunState(ruleSet, statedb, env, test.Exec)
@@ -134,14 +127,7 @@ func runStateTests(ruleSet RuleSet, tests map[string]VmTest, skipTests []string)
 
 func runStateTest(ruleSet RuleSet, test VmTest) error {
 	db, _ := ethdb.NewMemDatabase()
-	statedb, _ := state.New(common.Hash{}, db)
-	for addr, account := range test.Pre {
-		obj := StateObjectFromAccount(db, addr, account)
-		statedb.SetStateObject(obj)
-		for a, v := range account.Storage {
-			obj.SetState(common.HexToHash(a), common.HexToHash(v))
-		}
-	}
+	statedb := makePreState(db, test.Pre)
 
 	// XXX Yeah, yeah...
 	env := make(map[string]string)
@@ -178,16 +164,20 @@ func runStateTest(ruleSet RuleSet, test VmTest) error {
 			return fmt.Errorf("did not find expected post-state account: %s", addr)
 		}
 
-		if obj.Balance().Cmp(common.Big(account.Balance)) != 0 {
-			return fmt.Errorf("(%x) balance failed. Expected: %v have: %v\n", obj.Address().Bytes()[:4], common.String2Big(account.Balance), obj.Balance())
+		if balance, ok := new(big.Int).SetString(account.Balance, 0); !ok {
+			panic("malformed test account balance")
+		} else if balance.Cmp(obj.Balance()) != 0 {
+			return fmt.Errorf("(%x) balance failed. Expected: %v have: %v\n", obj.Address().Bytes()[:4], account.Balance, obj.Balance())
 		}
 
-		if obj.Nonce() != common.String2Big(account.Nonce).Uint64() {
+		if nonce, err := strconv.ParseUint(account.Nonce, 0, 64); err != nil {
+			return fmt.Errorf("test account %q malformed nonce: %s", addr, err)
+		} else if obj.Nonce() != nonce {
 			return fmt.Errorf("(%x) nonce failed. Expected: %v have: %v\n", obj.Address().Bytes()[:4], account.Nonce, obj.Nonce())
 		}
 
 		for addr, value := range account.Storage {
-			v := obj.GetState(common.HexToHash(addr))
+			v := statedb.GetState(obj.Address(), common.HexToHash(addr))
 			vexp := common.HexToHash(value)
 
 			if v != vexp {
@@ -212,13 +202,17 @@ func runStateTest(ruleSet RuleSet, test VmTest) error {
 }
 
 func RunState(ruleSet RuleSet, statedb *state.StateDB, env, tx map[string]string) ([]byte, vm.Logs, *big.Int, error) {
-	var (
-		data  = common.FromHex(tx["data"])
-		gas   = common.Big(tx["gasLimit"])
-		price = common.Big(tx["gasPrice"])
-		value = common.Big(tx["value"])
-		nonce = common.Big(tx["nonce"]).Uint64()
-	)
+	data := common.FromHex(tx["data"])
+	gas, _ := new(big.Int).SetString(tx["gasLimit"], 0)
+	price, _ := new(big.Int).SetString(tx["gasPrice"], 0)
+	value, _ := new(big.Int).SetString(tx["value"], 0)
+	if gas == nil || price == nil || value == nil {
+		panic("malformed gas, price or value")
+	}
+	nonce, err := strconv.ParseUint(tx["nonce"], 0, 64)
+	if err != nil {
+		panic(err)
+	}
 
 	var to *common.Address
 	if len(tx["to"]) > 2 {
@@ -227,17 +221,24 @@ func RunState(ruleSet RuleSet, statedb *state.StateDB, env, tx map[string]string
 	}
 	// Set pre compiled contracts
 	vm.Precompiled = vm.PrecompiledContracts()
-	snapshot := statedb.Copy()
-	gaspool := new(core.GasPool).AddGas(common.Big(env["currentGasLimit"]))
+	snapshot := statedb.Snapshot()
+	currentGasLimit, ok := new(big.Int).SetString(env["currentGasLimit"], 0)
+	if !ok {
+		panic("malformed currentGasLimit")
+	}
+	gaspool := new(core.GasPool).AddGas(currentGasLimit)
 
-	key, _ := hex.DecodeString(tx["secretKey"])
+	key, err := hex.DecodeString(tx["secretKey"])
+	if err != nil {
+		panic(err)
+	}
 	addr := crypto.PubkeyToAddress(crypto.ToECDSA(key).PublicKey)
 	message := NewMessage(addr, to, data, value, gas, price, nonce)
 	vmenv := NewEnvFromMap(ruleSet, statedb, env, tx)
 	vmenv.origin = addr
 	ret, _, err := core.ApplyMessage(vmenv, message, gaspool)
 	if core.IsNonceErr(err) || core.IsInvalidTxErr(err) || core.IsGasLimitErr(err) {
-		statedb.Set(snapshot)
+		statedb.RevertToSnapshot(snapshot)
 	}
 	statedb.Commit()
 

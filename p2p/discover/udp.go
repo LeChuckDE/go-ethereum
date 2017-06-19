@@ -49,7 +49,6 @@ var (
 // Timeouts
 const (
 	respTimeout = 500 * time.Millisecond
-	sendTimeout = 500 * time.Millisecond
 	expiration  = 20 * time.Second
 
 	ntpFailureThreshold = 32               // Continuous timeouts after which to check NTP
@@ -158,7 +157,6 @@ type udp struct {
 	gotreply   chan reply
 
 	closing chan struct{}
-	nat     nat.Interface
 
 	*Table
 }
@@ -593,12 +591,10 @@ func (req *findnode) handle(t *udp, from *net.UDPAddr, fromID NodeID, mac []byte
 		// (which is a much bigger packet than findnode) to the victim.
 		return errUnknownNode
 	}
-	target := crypto.Keccak256Hash(req.Target[:])
-	t.mutex.Lock()
-	closest := t.closest(target, bucketSize).entries
-	t.mutex.Unlock()
+	closest := t.closest(req.Target).Slice()
 
 	p := neighbors{Expiration: uint64(time.Now().Add(expiration).Unix())}
+
 	// Send neighbors in chunks with at most maxNeighbors per packet
 	// to stay below the 1280 byte limit.
 	for i, n := range closest {

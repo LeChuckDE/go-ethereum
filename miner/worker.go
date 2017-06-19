@@ -18,6 +18,7 @@ package miner
 
 import (
 	"fmt"
+	"log"
 	"math/big"
 	"sync"
 	"sync/atomic"
@@ -33,11 +34,8 @@ import (
 	"github.com/ethereumproject/go-ethereum/event"
 	"github.com/ethereumproject/go-ethereum/logger"
 	"github.com/ethereumproject/go-ethereum/logger/glog"
-	"github.com/ethereumproject/go-ethereum/pow"
 	"gopkg.in/fatih/set.v0"
 )
-
-var jsonlogger = logger.NewJsonLogger()
 
 const (
 	resultQueueSize  = 10
@@ -62,6 +60,7 @@ type uint64RingBuffer struct {
 // all of the current state information
 type Work struct {
 	config             *core.ChainConfig
+	signer             types.Signer
 	state              *state.StateDB // apply state changes here
 	ancestors          *set.Set       // ancestor set (used for checking uncle parent validity)
 	family             *set.Set       // family set (used for checking uncle invalidity)
@@ -101,7 +100,6 @@ type worker struct {
 
 	agents map[Agent]struct{}
 	recv   chan *Result
-	pow    pow.PoW
 
 	eth     core.Backend
 	chain   *core.BlockChain
@@ -110,7 +108,6 @@ type worker struct {
 
 	coinbase common.Address
 	gasPrice *big.Int
-	extra    []byte
 
 	currentMu sync.Mutex
 	current   *Work
@@ -118,8 +115,7 @@ type worker struct {
 	uncleMu        sync.Mutex
 	possibleUncles map[common.Hash]*types.Block
 
-	txQueueMu sync.Mutex
-	txQueue   map[common.Hash]*types.Transaction
+	txQueue map[common.Hash]*types.Transaction
 
 	// atomic status counters
 	mining int32
@@ -171,7 +167,7 @@ func (self *worker) pending() (*types.Block, *state.StateDB) {
 			self.current.receipts,
 		), self.current.state
 	}
-	return self.current.Block, self.current.state
+	return self.current.Block, self.current.state.Copy()
 }
 
 func (self *worker) start() {
@@ -266,7 +262,7 @@ func (self *worker) wait() {
 
 			if self.fullValidation {
 				if _, err := self.chain.InsertChain(types.Blocks{block}); err != nil {
-					glog.V(logger.Error).Infoln("mining err", err)
+					log.Println("mine: ignoring invalid block #%d (%x) received:", block.Number(), block.Hash(), err)
 					continue
 				}
 				go self.mux.Post(core.NewMinedBlockEvent{Block: block})
@@ -356,12 +352,13 @@ func (self *worker) push(work *Work) {
 
 // makeCurrent creates a new environment for the current cycle.
 func (self *worker) makeCurrent(parent *types.Block, header *types.Header) error {
-	state, err := state.New(parent.Root(), self.eth.ChainDb())
+	state, err := self.chain.StateAt(parent.Root())
 	if err != nil {
 		return err
 	}
 	work := &Work{
 		config:    self.config,
+		signer:    types.NewChainIdSigner(self.config.GetChainID()),
 		state:     state,
 		ancestors: set.New(),
 		family:    set.New(),
@@ -465,7 +462,7 @@ func (self *worker) commitNewWork() {
 		GasLimit:   core.CalcGasLimit(parent),
 		GasUsed:    new(big.Int),
 		Coinbase:   self.coinbase,
-		Extra:      self.extra,
+		Extra:      HeaderExtra,
 		Time:       big.NewInt(tstamp),
 	}
 	previous := self.current
@@ -580,7 +577,15 @@ func (env *Work) commitTransactions(mux *event.TypeMux, transactions types.Trans
 	for _, tx := range transactions {
 		// Error may be ignored here. The error has already been checked
 		// during transaction acceptance is the transaction pool.
-		from, _ := tx.From()
+		// We use the eip155 signer regardless of the current hf.
+		tx.SetSigner(env.signer)
+		from, _ := types.Sender(env.signer, tx)
+		// Check whether the tx is replay protected. If we're not in the EIP155 hf
+		// phase, start ignoring the sender until we do.
+		if tx.Protected() && !env.config.IsDiehard(env.header.Number) {
+			glog.V(logger.Detail).Infof("Transaction (%x) is replay protected, but we haven't yet hardforked. Transaction will be ignored until we hardfork.\n", tx.Hash())
+			continue
+		}
 
 		// Check if it falls within margin. Txs from owned accounts are always processed.
 		if tx.GasPrice().Cmp(gasPrice) < 0 && !env.ownedAccounts.Has(from) {
@@ -647,18 +652,11 @@ func (env *Work) commitTransactions(mux *event.TypeMux, transactions types.Trans
 }
 
 func (env *Work) commitTransaction(tx *types.Transaction, bc *core.BlockChain, gp *core.GasPool) (error, vm.Logs) {
-	snap := env.state.Copy()
+	snap := env.state.Snapshot()
 
-	// this is a bit of a hack to force jit for the miners
-	config := env.config.VmConfig
-	if !(config.EnableJit && config.ForceJit) {
-		config.EnableJit = false
-	}
-	config.ForceJit = false // disable forcing jit
-
-	receipt, logs, _, err := core.ApplyTransaction(env.config, bc, gp, env.state, env.header, tx, env.header.GasUsed, config)
+	receipt, logs, _, err := core.ApplyTransaction(env.config, bc, gp, env.state, env.header, tx, env.header.GasUsed)
 	if err != nil {
-		env.state.Set(snap)
+		env.state.RevertToSnapshot(snap)
 		return err, nil
 	}
 	env.txs = append(env.txs, tx)
